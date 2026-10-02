@@ -32,18 +32,18 @@
  */
 import { DurableObject } from "cloudflare:workers";
 import { handleAsNodeRequest } from "cloudflare:node";
-import { setBackend, existsSync, writeFileSync, installFetchBodies } from "./shims/fs.js";
+import { setBackend, existsSync, readFileSync, writeFileSync, installFetchBodies } from "./shims/fs.js";
 import { installTimers } from "./shims/timers.js";
 import { installTimeZone } from "./shims/tz.js";
 import { deliverWebhook, setWebhookRegistry, waitLive } from "./shims/spectrum.js";
-import { BUILTIN_PRESETS } from "../core/assets.js";
+import { BUILTIN_PRESETS, BUILTIN_TRANSFER_LOGOS } from "../core/assets.js";
 import { verifyPass } from "./gate.js";
 
 const PORT = 8787;
 const HEARTBEAT_MS = 30_000;
 const PHOTON = "https://spectrum.photon.codes";
 const COOKIE = "uranus_session";
-const RESTORE_PATHS = new Set(["/api/cloud/pull", "/api/backup/full/restore"]);
+const RESTORE_PATHS = new Set(["/api/cloud/pull"]);
 
 export class Uranus extends DurableObject {
   constructor(ctx, env) {
@@ -72,10 +72,12 @@ export class Uranus extends DurableObject {
     });
     installTimeZone(process.env.TZ);
     seedPresets();
+    seedTransferLogos();
     setWebhookRegistry({ ensure: (id, secret) => this.ensureWebhook(id, secret) });
     this.auth = await import("../core/server/src/auth.js");
     await this.seedPassword();
     await import("../core/server/src/index.js");
+    await installRestart();
     await this.arm();
   }
 
@@ -223,15 +225,13 @@ export class Uranus extends DurableObject {
       headers.set("cookie", `${COOKIE}=${encodeURIComponent(session.token)}`);
     } else if (bearer) headers.set("cookie", `${COOKIE}=${encodeURIComponent(bearer)}`);
 
-    // 云备份在这边只管往上传：解包要的临时空间和内存 Worker 给不起
+    // 云备份（从云盘整包拉取）没做：那条路会先把包存一份在云盘上，小手机这边不管云盘
     if (req.method === "POST" && RESTORE_PATHS.has(url.pathname)) {
       return withCors(
         Response.json(
           {
             ok: false,
-            error:
-              "小手机不支持从备份包恢复。要搬回来的话：配置用「导出配置」那份 JSON 导入，" +
-              "记忆库在记忆库面板里单独导入；或者把包拿到桌面版，用「完整备份」那里恢复。",
+            error: "小手机不支持从云盘拉取备份。要恢复的话：用「从备份恢复」那里上传 .tar.gz 或 .json。",
           },
           { status: 400 }
         ),
@@ -299,11 +299,52 @@ async function sha256(text) {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/**
+ * 「重启整个服务」在这里的样子（控制台按钮、`/重启` 指令、定时重启三条路）。
+ *
+ * 桌面版是让进程退出、由启动器拉起来。这边退不了：重置 DO（ctx.abort）只会
+ * 扔掉计时器和连接，模块还缓存在同一个 isolate 里，启动流程不会重跑 —— 日记、
+ * IG、主动消息的定时器全停，比不重启还糟。
+ *
+ * 所以注册成「原地重来」：restart.js 先照旧停掉所有桥接，再调这里清缓存、
+ * 按配置把连接重新连上。定时器本来就活着，不用动。
+ */
+async function installRestart() {
+  const [{ setInProcessRestart }, { clearCaches }, { syncBridges }, { loadConfig }] = await Promise.all([
+    import("../core/server/src/restart.js"),
+    import("../core/server/src/maintenance.js"),
+    import("../core/server/src/imessage.js"),
+    import("../core/server/src/config.js"),
+  ]);
+  setInProcessRestart(async () => {
+    clearCaches("重启");
+    await syncBridges(loadConfig);
+  });
+}
+
 /** 内置的两份默认预设放进虚拟盘，桌面版第一次建 data/presets 时会从这里拷 */
 function seedPresets() {
   for (const [name, json] of Object.entries(BUILTIN_PRESETS)) {
     const p = `/app/assets/presets/${name}`;
     if (!existsSync(p)) writeFileSync(p, JSON.stringify(json, null, 2));
+  }
+}
+
+/**
+ * 自带的转账 logo 放进虚拟盘（桌面版在 assets/transfer-logos/），界面上才列得出来。
+ * 内容变了就覆盖：这是随代码发的只读素材，不是用户的东西。真正画图靠的是
+ * sync-core 预渲的位图，见 shims/canvas.js。
+ */
+function seedTransferLogos() {
+  for (const [name, svg] of Object.entries(BUILTIN_TRANSFER_LOGOS)) {
+    const p = `/app/assets/transfer-logos/${name}`;
+    let old = null;
+    try {
+      old = String(readFileSync(p, "utf-8"));
+    } catch {
+      // 第一次启动还没有
+    }
+    if (old !== svg) writeFileSync(p, svg);
   }
 }
 
