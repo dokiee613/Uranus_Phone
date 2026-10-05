@@ -69,6 +69,9 @@ import {
   transcribeAudio,
   describeVideo,
 } from "./llm.js";
+import { testServer as testMcpServer } from "./mcp.js";
+import { mountTheater } from "./theater.js";
+import { mountPhone } from "./phonecheck.js";
 import {
   assistantGreeting,
   buildAssistantMessages,
@@ -287,10 +290,14 @@ app.use((req, res, next) => {
      * 在控制台上长得一模一样，没法排查。这里把差一点点的那些喊出来：
      * 只挑带 secret 痕迹或路径形似的，避免把正常的前端 POST 也刷进日志。
      */
+    // 控制台自己的 /api/* 不算（查手机的接口是 /api/phone/…，路径里也带 phone，
+    // 以前会被误报成「快捷指令 URL 填错」）。收图口子本身设在 /api/ 下时照旧比对
+    const ownApi = req.path.startsWith("/api/") && !want.startsWith("/api/");
     const looksLikeShot =
-      /screenshot|phone/i.test(req.path) ||
-      req.query?.secret != null ||
-      req.headers["x-spy-secret"] != null;
+      !ownApi &&
+      (/screenshot|phone/i.test(req.path) ||
+        req.query?.secret != null ||
+        req.headers["x-spy-secret"] != null);
     if (looksLikeShot && (req.method === "POST" || req.method === "PUT")) {
       logWarn(
         "查岗",
@@ -1307,6 +1314,26 @@ function bodyEndpoint(req) {
 app.post("/api/llm/test", async (req, res) => {
   const label = String(req.body?.label ?? "API");
   const result = await testEndpoint(bodyEndpoint(req), label);
+  res.status(result.ok ? 200 : 400).json(result);
+});
+
+// ---- 小剧场（侧边栏的「小剧场」分区，见 theater.js）----
+mountTheater(app, loadConfig);
+
+// ---- 查手机（侧边栏的「查手机」分区，见 phonecheck.js）----
+mountPhone(app, loadConfig);
+
+/**
+ * 测试一台 MCP 服务器：连上、握手、列工具。前端传的是界面上那份（可能还没保存），
+ * 测完就关，不进连接池（见 mcp.js:testServer）。
+ */
+app.post("/api/mcp/test", async (req, res) => {
+  const result = await testMcpServer(req.body?.server);
+  if (result.ok) {
+    logInfo("MCP", `测试连接成功：${result.server?.name || "服务器"}，${result.tools.length} 个工具，${result.ms}ms`);
+  } else {
+    logWarn("MCP", "测试连接失败", result.error);
+  }
   res.status(result.ok ? 200 : 400).json(result);
 });
 
