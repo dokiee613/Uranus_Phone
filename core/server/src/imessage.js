@@ -7,12 +7,15 @@ import {
   isCardUrl,
   mapsUrlFor,
   renderMapsLinks,
+  sendLayoutCard,
   sendTransferCard,
+  updateLayoutCard,
   updateTransferCard,
 } from "./card.js";
 import { watchChatBackground } from "./chatbg.js";
 import { normalizeForHistory, splitBubbles, sleep } from "./delay.js";
 import { checkLineRegistered, watchDelivery } from "./delivery.js";
+import { checkLineOwnership } from "./photon.js";
 import {
   chatWithFallback,
   describeImage,
@@ -34,10 +37,60 @@ import {
   userLabel,
 } from "./config.js";
 import { isCommandMessage, privacyOn, tryCommand } from "./commands.js";
-import { buildEnv } from "./env.js";
+import { buildEnv, userTzOf } from "./env.js";
+import {
+  addItem,
+  applyRoleTags,
+  describeForList,
+  dueAction,
+  fmtWhen,
+  leadOf,
+  listForCommand,
+  loadReminders,
+  localParts,
+  noteLastChat,
+  parseDayCommand,
+  parseRemindCommand,
+  patchItem,
+  reminderPromptState,
+  removeItem,
+  specialName,
+  splitReminderTags,
+  updateReminders,
+} from "./reminder.js";
 import { pickEmoji } from "./emoji.js";
 import { isDocAttachment, readDocument } from "./docread.js";
 import { notePrompt } from "./lastprompt.js";
+import { nodeOnline, sendToNode } from "./callapi.js";
+import {
+  endCall,
+  getCall,
+  primeGreeting,
+  sayDuration,
+  startCall,
+  takeGreeting,
+} from "./callsession.js";
+import { noteCall } from "./calllog.js";
+import {
+  findFaceTimeLink,
+  inviteNotice,
+  isFaceTimeInvite,
+  readAnswer,
+  readHangUp,
+} from "./calltags.js";
+import { pickSttSource, transcribe as sttTranscribe } from "./stt.js";
+import {
+  callRecordLine,
+  callUserMessage,
+  listenAmbience,
+  noteTurn,
+  runCallTurn,
+  seeFrame,
+  synthesizeSay,
+  takeAmbience,
+  takeFrame,
+  transcribe,
+} from "./callturn.js";
 import { fetchLinkImages, fetchLinkVideos, renderLinks } from "./linkmeta.js";
 import { igComposeNote, igRouteFor, publishIgTags, publishLines, tickIgQueue } from "./igrun.js";
 import { splitIg, stripIgTags } from "./igtags.js";
@@ -49,6 +102,7 @@ import {
   describeEffectId,
   generateImage,
   hasLeaveOnRead,
+  imageLooksComplete,
   resolveRefFile,
   shrinkForVision,
   splitMedia,
@@ -110,6 +164,16 @@ import { applyAndLog } from "./regex.js";
 import { requestRestart } from "./restart.js";
 import { appendTurn, followLineChange, readSession, recentMessages, sessionIdFor } from "./sessions.js";
 import { hasFix, hasMoved, locationHint, watchFriendLocations } from "./friendloc.js";
+// 共感娃娃：连手机上的 phyphox、认出一次拥抱、拼那句系统提示（见 doll.js 文件头）
+import {
+  createDollState,
+  feedDollSamples,
+  fetchDollSamples,
+  flushSilentHold,
+  renderHugLine,
+  shouldTryStart,
+  startDollMeasuring,
+} from "./doll.js";
 import {
   DEVICE_NAMES,
   phonePool,
@@ -122,6 +186,22 @@ import {
 } from "./spy.js";
 import { renderLogo } from "./transferlogo.js";
 import { findTransfer, putTransfer, readTransfers } from "./transferstore.js";
+import {
+  draftOrder,
+  linesText,
+  autoMenuText,
+  cancelLuckinOrder,
+  brandReady,
+  luckinWanted,
+  money as luckinMoney,
+  orderStatus,
+  parseOrderSpec,
+  placeOrder,
+  resolveLocation,
+} from "./luckin.js";
+import { findOrder, putOrder, readOrders } from "./luckinstore.js";
+import { autoMcdMenuText, cancelMcdOrder, draftMcdOrder, mcdWanted, placeMcdOrder } from "./mcd.js";
+import { orderLogo } from "./orderlogos.js";
 import { parseSearchQueries, runSearch, stripSearchTags } from "./websearch.js";
 import {
   injectToolPrompt,
@@ -189,6 +269,11 @@ const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
  *
  * 20 秒：正常一张手机照片一两秒就下完，这个数碰不到；真卡住的那种，二十秒
  * 之后多等也只是让对方干等。
+ *
+ * 上面那个 321 秒的案例后来查清了，是 HTTP/2 接收窗口没配导致的（详见
+ * http2window.js）—— 窗口修好之后 3.1MB 实测 1.9 秒，这个 20 秒的闸门
+ * 日常更碰不到了。留着它是因为「服务端回源慢」那一类卡顿还在：实机见过
+ * 第一个字节等 80～120 秒，那种跟带宽无关，照样得让这一轮先走。
  */
 const IMAGE_PATIENCE_MS = 20_000;
 
@@ -412,6 +497,29 @@ function createRunner(projectRefId) {
     // （transferstore 的 reminded）—— 只提醒一次这件事不能靠定时器保证，
     // 定时器活不过重启。见 armTransferRemind
     transferRemind: new Map(),
+    // peerKey -> {lat, lon}：对方在对话里最近发来的位置，瑞幸找店用（见 notePeerLocation）
+    luckinLoc: new Map(),
+    // 「取餐码提醒」的轮询定时器，按 `角色key::卡片guid` 索引。只在内存里，见 armLuckinPoll
+    luckinPoll: new Map(),
+    // 定时提醒的心跳（见 armReminders）和「标记写错了」那几句系统提示：
+    // peerKey -> [hint]，对方下一条消息进来时一起递给模型，和 reactPending 一个路子，
+    // 但不过期 —— 提醒可能是明天的事，对方隔一个小时才回也得让角色知道没设上
+    reminderTimer: null,
+    reminderBusy: false,
+    reminderHints: new Map(),
+    /*
+     * 共感娃娃（见 doll.js）。
+     *
+     * 这里只有**按角色算**的那两笔。轮询和状态机是**整个进程一份**的
+     * （见下面那个 dollWatcher）—— 玩偶里只有一部手机，每条连接各开一条
+     * 轮询等于拿 N 倍的请求去打一个单线程的服务器。
+     *
+     * 两笔都只在内存里：「刚才被抱了」这件事过了就过了，重启之后从头听，
+     * 不该把关机期间的拥抱补发出来（和提醒相反 —— 那是用户约好的时刻，
+     * 这是一个当场的动作）。
+     */
+    hugCooldownUntil: 0, // 冷却到什么时候（角色的 hug.cooldownMinutes）
+    hugPending: 0, // 冷却期内攒下的次数，下次一起说（那句话里的 {{次数}}）
     stopped: false, // stopBridge 之后消息循环要认得出自己已经过期
     retries: 0, // 连续失败了几次，决定下次等多久（见 RETRY_DELAYS）
     retryTimer: null, // 待触发的自动重连
@@ -1023,6 +1131,17 @@ async function readImage(content, scope = "桥接") {
   if (buf.length > MAX_IMAGE_BYTES) {
     throw new Error(`图片 ${mb(buf.length)}MB，超过 ${cap}MB 上限`);
   }
+  /*
+   * 残缺的图**不送去识别**，宁可这一轮当没收到。
+   *
+   * 半份 JPEG 不会报错、也不会是空的 —— 它会被解码器补成一张下半截死黑的图，
+   * 模型照着那张黑图一本正经地描述一通（用户报的「识图识出一片黑」）。
+   * 那比「没看见图」糟得多：没看见还能从上下文绕过去，看见一张假图就是
+   * 言之凿凿地说错话。详见 media.js:imageLooksComplete。
+   */
+  if (!imageLooksComplete(buf)) {
+    throw new Error(`图片没下全（${mb(buf.length)}MB，结尾标记不在），这一轮不送去识别`);
+  }
 
   /*
    * 压小再识别。上限判定用的是**原图**大小（上面那两处）—— 压缩是优化，
@@ -1454,23 +1573,48 @@ async function describeImages(endpoint, prompt, max, runner, images) {
 }
 
 /**
- * 把这一轮收到的语音条逐条交给多模态模型听，拼成一段文字。
+ * 把这一轮收到的语音条逐条听成文字。
  *
  * 结构和 describeImages 一模一样（单条失败不拖垮整轮、超上限的截断并说明、
- * 没启用时给一句让模型知道「有东西但你听不到」的降级文案），区别只在
- * 打的是哪个接口 —— 见 llm.js:transcribeAudio。
+ * 没启用时给一句让模型知道「有东西但你听不到」的降级文案）。
  *
- * 提示词有两套（只转写 / 连语气环境音一起报），选哪套在 config.js 里按角色的
- * 「情绪识别」开关决定，到这里已经是一个字符串了。
+ * ── 两条路，按「情绪识别」那个开关分 ──
+ *
+ * **关着**（只要原话）→ 优先走专门的 STT（`stt.js`）：一秒内返回、便宜一个
+ * 数量级、而且不会"理解"音频 —— 多模态模型实测会把一句「Hi」扩写成报告，
+ * 或者对着静音编出鸟鸣（config.js:55 那段注释记了这件事）。
+ *
+ * **开着**（要语气、环境音、说话人数）→ 只能走多模态：那些东西专门的 STT
+ * 给不出来，它只管转字。
+ *
+ * 两条都没配就走降级文案。
  *
  * @param {object|null} endpoint 听音模型的 endpoint，null = 没开或引用失效
+ * @param {object} [opts] `{ sttApi, rich }` —— rich = 要不要语气环境音那一套
  * @returns {Promise<{text:string,total:number,failed:number,firstError:Error|null}>}
  */
-async function describeVoices(endpoint, prompt, max, runner, voices) {
+async function describeVoices(endpoint, prompt, max, runner, voices, opts = {}) {
   const scope = scopeOf(runner, "听音");
   if (!voices.length) return { text: "", total: 0, failed: 0, firstError: null };
 
-  if (!endpoint) {
+  /*
+   * 走专门的 STT 还是多模态模型 —— 由角色那栏的「用哪个来转写」决定
+   * （`role.audioModel.source`，见 config.js）。
+   *
+   *   "stt"   只用 STT。没配 STT 的话下面会退回多模态（总比听不见好）
+   *   "model" 只用多模态，哪怕 STT 配着
+   *   "auto"  配了 STT 就用它；但开了「情绪识别」还是走多模态 ——
+   *           语气、环境音、几个人在说话这些专门的 STT 给不出来
+   *
+   * 日志里**说清这一轮用的是哪条**：以前这个判断完全藏在代码里，用户配好了
+   * STT、看到日志里还在打 gemini-3.8-flash，从界面上根本看不出为什么。
+   */
+  const sttReady = Boolean(pickSttSource(opts.sttApi));
+  const source = opts.source ?? "auto";
+  const stt =
+    source === "model" ? null : sttReady && (source === "stt" || !opts.rich) ? opts.sttApi : null;
+
+  if (!endpoint && !stt) {
     logInfo(
       scope,
       `收到 ${voices.length} 条语音，但这个角色没启用语音识别（或引用的模型已失效），已跳过`
@@ -1488,6 +1632,22 @@ async function describeVoices(endpoint, prompt, max, runner, voices) {
     logWarn(scope, `这轮收到 ${voices.length} 条语音，按上限只识别前 ${use.length} 条`);
   }
 
+  // 这一轮走的是哪条路，以及为什么 —— 省掉「我配了 STT 它怎么不用」这种排查
+  logDebug(
+    scope,
+    stt
+      ? `这轮用专门的转写服务（${source === "stt" ? "你指定了它" : "自动挑的"}）`
+      : `这轮用多模态模型${
+          source === "model"
+            ? "（你指定了它）"
+            : opts.rich
+              ? "（开着「识别情绪与环境音」，专门的转写服务给不出这些）"
+              : sttReady
+                ? ""
+                : "（没配专门的转写服务）"
+        }`
+  );
+
   // 同 describeImages：几条语音同时听，顺序按下标定（见那边的注释）
   const settled = await Promise.all(
     use.map(async (voice, i) => {
@@ -1499,7 +1659,26 @@ async function describeVoices(endpoint, prompt, max, runner, voices) {
       );
       const startedAt = Date.now();
       try {
-        const desc = await transcribeAudio(endpoint, prompt, voice);
+        let desc;
+        if (stt) {
+          /*
+           * 专门的 STT。`voice` 带的是 base64（readAudio 那边转好的），
+           * 这里要字节，所以解回来。
+           */
+          const bytes = Buffer.from(voice.base64, "base64");
+          const r = await sttTranscribe(stt, bytes, {
+            mimeType: voice.mimeType || "audio/mpeg",
+            scope,
+          });
+          desc = r?.text ?? "";
+          // 转写服务配着却回了空 —— 退回多模态再试一次，别让这条语音白瞎
+          if (!desc && endpoint) {
+            logWarn(scope, `${label}转写服务回了空，用多模态再试一次`);
+            desc = await transcribeAudio(endpoint, prompt, voice);
+          }
+        } else {
+          desc = await transcribeAudio(endpoint, prompt, voice);
+        }
         logInfo(
           scope,
           `${label}识别完成（${secsSince(startedAt)}s）：${desc.slice(0, 60)}${desc.length > 60 ? "…" : ""}`
@@ -1978,6 +2157,28 @@ async function handleCommand(getConfig, runner, space, spaceId, userText, peer =
    * 「开始生成」，生成在后台跑，跑完再发一条（成品标题 + 一小段正文）。
    * 两条都不进历史存档。HTML 本身在 iMessage 里显示不了，去控制台「小剧场」里看。
    */
+  /*
+   * 定时提醒那几条：commands.js 只认出是哪条，时间要按 {{user}} 的时区解析
+   * （异步查城市），所以在这儿做。和别的指令一样不进上下文、不打模型。
+   */
+  if (result.reminder) {
+    let text;
+    try {
+      text = await runReminderCommand(role, result.reminder, {
+        projectRefId: runner.projectRefId,
+        spaceId,
+        peer: peer || spaceId,
+      });
+    } catch (e) {
+      logError(scope, "提醒指令出错", e);
+      text = `⚠️ 提醒没加上：${String(e?.message ?? e)}`;
+    }
+    await sendSystem(runner, space, text, { what: "提醒指令" }).catch((e) =>
+      logWarn(scope, "提醒指令的回执没发出去", e)
+    );
+    return true;
+  }
+
   if (result.theater) {
     const t = result.theater;
     let job;
@@ -2004,9 +2205,13 @@ async function handleCommand(getConfig, runner, space, spaceId, userText, peer =
          * 「注入提示词 + 小剧场提示词 + 正文」当成对方发来的一轮交给 handleTurn ——
          * 角色照常回复、照常发出去，这一轮和回复一起进会话历史，之后聊天都带着它。
          * 和插件一样只在指令这条路上做；面板里生成的不注入。
+         *
+         * 要不要注入看成品上那个 `inject` —— 生成那一刻就定死了（三档开关 +
+         * 模板上的勾，见 theater.js:shouldInject）。不在这儿重读配置：重试和
+         * 续写出来的成品跟着原来那次的决定走。
          */
         const config = getConfig();
-        if (!config.theater?.injectAfterGeneration) return;
+        if (!play.inject) return;
         await sleep(5);
         logInfo(scope, `小剧场《${play.title}》注入当前会话，让角色回应`);
         await handleTurn(getConfig, runner, space, spaceId, reactionPrompt(config, play), [], peer, {});
@@ -2795,6 +3000,74 @@ async function searchRound(
 }
 
 /**
+ * 「看菜单」的那一趟往返：模型写了 `[看菜单:瑞幸]` / `[看菜单:麦当劳@到店]` 时，
+ * 真去查一次菜单，接在回复后面再问一次。和 searchRound 一个形态 —— 对方只收到第二次的回复，
+ * 菜单只活在这一次的副本里，不进历史和存档。
+ *
+ * 没写品牌（`[看菜单]`）就按话里提到的猜，猜不出就两家都看（开着的那几家）。
+ * 一家都没开 / 都查不到也问第二次，告诉模型没看到，免得它干等着。
+ *
+ * @returns {Promise<string|null>} 第二次的回复；这轮没写标记返回 null
+ */
+const MENU_TAG = /[[［]\s*(?:看菜单|查菜单|瑞幸菜单|麦当劳菜单|menu)\s*(?:[:：]\s*([^\]］]{0,120}?))?\s*[\]］]/gi;
+
+async function menuRound(reply, { runner, role, config, peer, eps, params, messages, scope, llmScope, onPrompt }) {
+  const tags = [...String(reply ?? "").matchAll(MENU_TAG)];
+  if (!tags.length) return null;
+  const user = resolveUser(config, role);
+  const want = new Map(); // brand -> 到店/外送
+  for (const t of tags) {
+    const head = t[0];
+    const arg = String(t[1] ?? "");
+    const store = /@\s*到店|自提/.test(arg) ? "到店" : /@\s*外送|外卖/.test(arg) ? "外送" : "";
+    if (/瑞幸|luckin|咖啡/i.test(head + arg)) want.set("luckin", "");
+    else if (/麦当劳|mcd|麦记/i.test(head + arg)) want.set("mcd", store);
+    else {
+      for (const b of ["luckin", "mcd"]) if (role?.[b]?.enabled) want.set(b, store);
+    }
+  }
+
+  const blocks = [];
+  for (const [brand, store] of want) {
+    const b = ORDER_BRANDS[brand];
+    const bScope = scopeOf(runner, b.label);
+    if (!role?.[brand]?.enabled) {
+      blocks.push(`${b.label}：这个功能没开，看不了。`);
+      continue;
+    }
+    if (!brandReady(config, brand)) {
+      blocks.push(`${b.label}：还没配好，看不了菜单。`);
+      continue;
+    }
+    try {
+      const loc = await luckinLocation(runner, { peer, config, role }, bScope);
+      if (!loc && b.needsLoc) {
+        blocks.push(`${b.label}：不知道{{user}}在哪儿，查不了附近门店。`);
+        continue;
+      }
+      const useRole = brand === "mcd" && store ? { ...role, mcd: { ...role.mcd, mode: store === "到店" ? "pickup" : "delivery" } } : role;
+      blocks.push(`【${b.label}】\n${await b.menu(config, loc, useRole, bScope, user)}`);
+      logInfo(bScope, "模型要看菜单，查好了递给它");
+    } catch (e) {
+      logWarn(bScope, "模型要看菜单，没查到", e);
+      blocks.push(`${b.label}：菜单这会儿没查到（${String(e?.message ?? e).slice(0, 80)}）。`);
+    }
+  }
+
+  const note =
+    `<菜单>\n${blocks.join("\n\n") || "没有能看的菜单。"}\n</菜单>\n\n` +
+    "上面是你刚看的菜单（{{user}}看不到这一步）。现在正式回复{{user}}，别再写 [看菜单:…]。" +
+    "要帮忙点就照点单的格式写，商品名照菜单上的写；只是聊聊、推荐的话就按人设自然地说。" +
+    "照你原来的格式回答（思考块、气泡分隔这些照旧写）。";
+  const followUp = [...messages, { role: "assistant", content: reply }, { role: "user", content: note }];
+  logInfo(llmScope, `菜单注入 ${want.size} 家，只注入这一次`, blocks.join("\n\n"));
+  onPrompt?.(followUp);
+  const { content } = await chatWithFallback(eps.chat, eps.fallback, followUp, params);
+  logInfo(llmScope, `看完菜单后的回复 ${content.length} 字`, content);
+  return content;
+}
+
+/**
  * MCP 工具的那几趟往返（见 mcp.js）。
  *
  * 模型第一次回复里要了工具（文本标记 `[工具:名字 {…}]`，或者原生的 tool_calls）
@@ -3192,9 +3465,19 @@ async function handleTurn(
    * 视频那一路识别完会在自己内部把字节放掉（见 describeVideos），所以从这行
    * 往下，这一轮只剩几百字的描述在手上。
    */
+  // 这里就要拿最新配置：下面语音那一路要用 sttApi 和角色的情绪识别开关
+  const freshConfig = getConfig();
+  const freshRole = currentRole(freshConfig, runner) ?? role;
+
   const [vision, voice, video] = await Promise.all([
     describeImages(eps.vision, eps.visionPrompt, eps.maxImages, runner, images),
-    describeVoices(eps.audio, eps.audioPrompt, eps.maxClips, runner, voices),
+    describeVoices(eps.audio, eps.audioPrompt, eps.maxClips, runner, voices, {
+      sttApi: freshConfig.sttApi,
+      // 开了「情绪识别」就得走多模态 —— 语气、环境音、说话人数专门的 STT 给不出来
+      rich: Boolean(freshRole.audioModel?.emotion),
+      // 「用哪个来转写」：auto / stt / model，见 config.js:audioModel.source
+      source: freshRole.audioModel?.source ?? "auto",
+    }),
     describeVideos(eps.video, eps.videoPrompt, eps.maxVideos, runner, videos),
   ]);
   /*
@@ -3230,8 +3513,6 @@ async function handleTurn(
   }
 
   const llmScope = scopeOf(runner, "LLM");
-  const freshConfig = getConfig();
-  const freshRole = currentRole(freshConfig, runner) ?? role;
   const user = resolveUser(freshConfig, freshRole);
 
   /*
@@ -3264,7 +3545,24 @@ async function handleTurn(
    * 时间戳本来也该保持是原来那个。天气照旧现查现注入 —— 它不进存档，
    * 每次生成都是拿此刻的那份（和用户「什么时候生成就注入什么时间的天气」一致）。
    */
-  const combined = isReroll ? said : timePrefix + said;
+  let combined = isReroll ? said : timePrefix + said;
+
+  /*
+   * 对方发来了一条 FaceTime 链接 —— 在这一轮的用户消息后面补一句，让角色
+   * 自己决定接不接。
+   *
+   * **不直接入会**：角色正在忙、在生气、在开车，完全可以不接，这一句比什么都
+   * 有「活人感」。真正起通话在下面拿到模型回复之后（搜 meta.callInvite）。
+   *
+   * 功能没开、节点没配、或者这台角色压根不接电话时，这整段不进提示词 ——
+   * 那样模型看到一条奇怪的指令却没有对应的能力，只会胡乱回应。
+   */
+  const callLink = isCallInvite(freshConfig, freshRole, said) ? findFaceTimeLink(said) : "";
+  if (callLink && !isReroll) {
+    meta.callInvite = callLink;
+    combined += `\n${inviteNotice(user?.name ?? "{{user}}")}`;
+    logInfo(scope, "对方发来一通 FaceTime 邀请，问问角色接不接");
+  }
 
   /*
    * 一个字没打、而且这轮收到的图 / 语音 / 视频**全都**识别失败：模型拿到的
@@ -3307,12 +3605,33 @@ async function handleTurn(
 
   // 提示词组装：预设的条目顺序 + 世界书 + 裁剪过的上文，见 prompt.js。
   // 天气单独传 —— 它只进这一份，不进 history
+  // 瑞幸那条子条目这轮给什么（菜单要在调模型之前查好，见 orderPromptState）
+  const luckin = await orderPromptState(
+    "luckin",
+    runner,
+    freshConfig,
+    freshRole,
+    peer,
+    runner.history.get(sessionId) ?? [],
+    scopeOf(runner, "瑞幸")
+  );
+  const mcd = await orderPromptState(
+    "mcd",
+    runner,
+    freshConfig,
+    freshRole,
+    peer,
+    runner.history.get(sessionId) ?? [],
+    scopeOf(runner, "麦当劳")
+  );
+  const reminder = await reminderStateFor(freshRole);
   const built = await buildPrompt(
     freshConfig,
     freshRole,
     user,
     runner.history.get(sessionId) ?? [],
-    weatherNote
+    weatherNote,
+    { luckin, mcd, reminder }
   );
   const { params, preset, worldInfo } = built;
   // buildPrompt 裁剪过上文，把结果写回内存 —— 以前是 buildMessages 里做的
@@ -3390,6 +3709,52 @@ async function handleTurn(
   logInfo(llmScope, `模型回复 ${reply.length} 字，花了 ${secsSince(askedAt)}s`, reply);
 
   /*
+   * 对方发来的是 FaceTime 邀请，而角色答应接了 —— 起一通电话。
+   *
+   * **必须排在所有这些分支的最前面。** 实测踩过一次：那一轮角色同时写了
+   * `[leave_on_read]`，于是「已读不回」把整段回复连同入会的意思一起吞掉了，
+   * 对方对着一通永远接不通的电话干等。撤回、Instagram 那几条同理。
+   *
+   * 角色回 [拒绝通话] 或者什么都没写：什么都不做，正文照常往下走各种分支发出去
+   * （「现在在开车，等会儿打给你」这种话该正常发出去）。
+   */
+  if (meta.callInvite) {
+    const { answer, text: withoutTags } = readAnswer(reply);
+    reply = withoutTags;
+    if (answer === "accept") {
+      /*
+       * `[接受通话]` 后面那段话是**开场白**，不是短信。
+       *
+       * 它要在电话接通的瞬间念出来（见 callsession.js 里 greeting 那个字段），
+       * 所以这一轮的正文要清空 —— 否则对方会先在 iMessage 里收到一条
+       * 「喂？怎么了」，几秒后又在电话里听到同一句，很出戏。
+       *
+       * 想在接之前发一句短信（「等我一下」）是另一个口子：
+       * `role.call.pickingUpTemplate`。
+       */
+      const greeting = reply.trim();
+      const ok = await beginCall(getConfig, {
+        runner,
+        role: freshRole,
+        spaceId,
+        peer,
+        link: meta.callInvite,
+        greeting,
+      });
+      // 接起来了的话，这一轮正文为空是正常的 —— 见下面那个判空分支
+      meta.callAnswered = ok;
+      if (ok && greeting) {
+        reply = "";
+        logInfo(scope, `角色接了这通电话，接通后第一句已经写好了`, greeting);
+      } else {
+        logInfo(scope, ok ? "角色接了这通电话" : "角色想接，但没接起来");
+      }
+    } else {
+      logInfo(scope, answer === "reject" ? "角色拒接了" : "角色没表态，当作没接");
+    }
+  }
+
+  /*
    * MCP 工具：模型要了工具就真去调，拿结果再问（可能连着几趟，见 mcpRound）。
    *
    * **排在搜索之前**：原生模式下只有第一次请求带着工具清单，tool_calls 只会
@@ -3445,6 +3810,28 @@ async function handleTurn(
     await respondingWhile(space, () => notifyFailure(runner, space, "这条消息没回上来", e), runner);
     throw e;
   }
+
+  // 看菜单：[看菜单:瑞幸] / [看菜单:麦当劳]，查到了接上再问一次（见 menuRound）
+  try {
+    const viewed = await menuRound(reply, {
+      runner,
+      role: freshRole,
+      config: freshConfig,
+      peer,
+      eps,
+      params,
+      messages,
+      scope,
+      llmScope,
+      onPrompt: (followUp) => notePrompt(promptMeta, followUp),
+    });
+    if (viewed !== null) reply = viewed;
+  } catch (e) {
+    logError(llmScope, "看完菜单那次生成失败，这一轮没能拿到回复", e);
+    await respondingWhile(space, () => notifyFailure(runner, space, "这条消息没回上来", e), runner);
+    throw e;
+  }
+
 
   /*
    * 查岗：回复里写了 `[查岗实时电脑屏幕]` / `[查岗实时手机屏幕]` 就真去抓一张
@@ -3647,6 +4034,7 @@ async function handleTurn(
    * 先让 IG 那边看见的话会被当成私聊发图。发布在后台跑（见 xhsrun.js 顶上），
    * 这里拿到的只是写上下文的那几句。
    */
+  forUser = await takeReminders(runner, freshRole, spaceId, peer, forUser);
   const xhsLines = takeXhs(freshConfig, freshRole, forUser, scope);
   forUser = xhsLines.rest;
   if (igRouteFor(freshRole, forUser)) {
@@ -3686,8 +4074,13 @@ async function handleTurn(
    *
    * `igDone` 那一轮也是正常的：帖子发出去了、方括号之外一个字没写，forUser
    * 本来就该是空的。那不是失败，别弹「这条没能生成正文」。
+   *
+   * 接电话那一轮同理：角色只写了 `[接受通话]`，剥掉标记之后正文本来就是空的
+   * —— 它这一轮要做的事（入会）已经做了，没什么要发短信说的。实测第一通电话
+   * 就在这儿报了「这一轮没有可发送的正文」，还给对方发了一条出错提示，
+   * 而电话其实正常接通了。
    */
-  if (!forUser.trim() && !igDone) {
+  if (!forUser.trim() && !igDone && !meta.callAnswered) {
     /*
      * 四种空回，**责任方各不相同** —— 所以每种都要点出该去动哪儿。
      *
@@ -4423,19 +4816,24 @@ async function fireProactive(getConfig, runner, spaceId) {
  * 时间前缀照加：和别的 user 轮次一致，「自主判断」那边也要靠它才知道
  * 上一次是什么时候的事。
  */
-async function runProactiveTurn(getConfig, runner, slot, spaceId) {
+async function runProactiveTurn(getConfig, runner, slot, spaceId, override = null) {
   const config = getConfig();
   const role = currentRole(config, runner);
-  const scope = scopeOf(runner, "主动消息");
+  /*
+   * override 那一路现在有两种来路（定时提醒、共感娃娃），所以日志的分类由
+   * 调用方给。没给的按「定时提醒」—— reminderInput 就没给，它是先来的那个。
+   */
+  const scope = scopeOf(runner, override ? override.scope ?? "定时提醒" : "主动消息");
   const llmScope = scopeOf(runner, "LLM");
   const space = slot.space;
   const peer = slot.peer || spaceId;
 
-  if (!role?.proactive?.enabled) return;
+  // 定时提醒借这条路开口（override 带着那段提示词），不看主动消息的开关
+  if (!override && !role?.proactive?.enabled) return;
 
   const eps = resolveRoleEndpoints(config, role);
   if (!eps.chat) {
-    logError(scope, "这个角色的聊天 API 没配好，主动消息发不了");
+    logError(scope, `这个角色的聊天 API 没配好，${override ? override.label ?? "提醒" : "主动消息"}发不了`);
     return;
   }
 
@@ -4443,7 +4841,7 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId) {
   loadHistory(runner, role, sessionId, scope);
 
   const user = resolveUser(config, role);
-  const { toModel, toHistory } = buildProactiveInput(role, user, { read: slot.read });
+  const { toModel, toHistory } = override ?? buildProactiveInput(role, user, { read: slot.read });
   if (!toModel.trim()) {
     logWarn(scope, "主动消息提示词是空的，这次不发");
     return;
@@ -4456,15 +4854,20 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId) {
    * 只进**这一次请求**，和上面那段提示词一样不落历史 —— 落了的话每轮都要
    * 重发一遍，而且模型会以为自己刚被要求发帖，下一轮接着发。
    */
-  const composeNote = [igComposeNote(config, role, { user }), xhsComposeNote(config, role, { user })]
-    .filter(Boolean)
-    .join("\n\n");
+  // 提醒那一轮就是来提醒的，不给发帖的选项
+  const composeNote = override
+    ? ""
+    : [igComposeNote(config, role, { user }), xhsComposeNote(config, role, { user })]
+        .filter(Boolean)
+        .join("\n\n");
   const forModel = composeNote ? `${toModel}\n\n${composeNote}` : toModel;
   if (composeNote) logDebug(scope, `${role.name} 这一轮可以顺手发条 Instagram`);
 
   logInfo(
     scope,
-    `触发主动消息（${sessionId}）${slot.read ? "，对方已读上一条但没回" : ""}`
+    override
+      ? `触发${override.label}（${sessionId}）`
+      : `触发主动消息（${sessionId}）${slot.read ? "，对方已读上一条但没回" : ""}`
   );
 
   // 时间前缀和正常轮次同一个来路；天气照旧只进这一份提示词，不进存档
@@ -4479,7 +4882,18 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId) {
   const historyArr = runner.history.get(sessionId) ?? [];
   const forPrompt = [...historyArr, { role: "user", content: timePrefix + forModel }];
 
-  const built = await buildPrompt(config, role, user, forPrompt, weatherNote);
+  /*
+   * 提醒那一轮可能正是「帮我点早餐」：点单那两条要按这份上文判要不要给完整说明
+   * （提醒原文里有「麦当劳」就会给），菜单也要在这儿先查好，和正常轮次一个规矩。
+   */
+  const orderState = override
+    ? {
+        luckin: await orderPromptState("luckin", runner, config, role, peer, forPrompt, scopeOf(runner, "瑞幸")),
+        mcd: await orderPromptState("mcd", runner, config, role, peer, forPrompt, scopeOf(runner, "麦当劳")),
+      }
+    : {};
+  const reminder = await reminderStateFor(role);
+  const built = await buildPrompt(config, role, user, forPrompt, weatherNote, { ...orderState, reminder });
   const { params, preset, worldInfo } = built;
   // MCP 工具：主动开口的这一路也给（「早上自己开口前先查一下今天的日程」），
   // 和正常轮次同一套，见那边的注释
@@ -4565,6 +4979,27 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId) {
     if (searched !== null) reply = searched;
   } catch (e) {
     logError(llmScope, "主动消息搜索之后那次生成失败，这次跳过", e);
+    runner.history.set(sessionId, historyArr);
+    return;
+  }
+
+  // 看菜单：主动开口那一轮也能先看一眼（「下午了，看看瑞幸有啥新品」）
+  try {
+    const viewed = await menuRound(reply, {
+      runner,
+      role,
+      config,
+      peer,
+      eps,
+      params,
+      messages,
+      scope,
+      llmScope,
+      onPrompt: (followUp) => notePrompt(promptMeta, followUp),
+    });
+    if (viewed !== null) reply = viewed;
+  } catch (e) {
+    logError(llmScope, "主动消息看完菜单那次生成失败，这次跳过", e);
     runner.history.set(sessionId, historyArr);
     return;
   }
@@ -4667,6 +5102,7 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId) {
   let recorded = reply;
   let igDone = false;
   // 小红书先摘，理由见正常轮次那段
+  forUser = await takeReminders(runner, freshRole, spaceId, peer, forUser);
   const xhsLines = takeXhs(freshConfig, freshRole, forUser, scope);
   forUser = xhsLines.rest;
   if (igRouteFor(freshRole, forUser)) {
@@ -4772,12 +5208,710 @@ async function runProactiveTurn(getConfig, runner, slot, spaceId) {
       return;
     }
     runner.messageCount += 1;
+    // 提醒那一轮借的是主动消息的路，「等对方回话 / 已读没回」那两笔是主动消息自己的账，别动
+    if (override) return;
     // 从这一刻起等对方回话：期间收到已读回执就记一笔，下一条会缀上那句话
     slot.awaiting = true;
     slot.read = false;
     // 这两笔要跟着表一起落盘，不然重启后「已读但没回」就丢了
     saveSlot(runner.projectRefId, spaceId, slot);
   }, runner);
+}
+
+/* ================= 定时提醒（数据和算时间见 reminder.js） ================= */
+
+/** 心跳间隔。小手机那边 DO 的心跳是 30 秒，这里再短一截，到点最多晚这么久。 */
+const REMINDER_TICK_MS = 20_000;
+
+/**
+ * 提示词里那条子条目要的三个变量，按 {{user}} 的时区算好。
+ * 角色没开定时提醒就不算 —— 那条子条目反正会被角色闸挡掉。
+ */
+async function reminderStateFor(role) {
+  if (!role?.reminder?.enabled) return undefined;
+  try {
+    return reminderPromptState(role.id, await userTzOf(role));
+  } catch (e) {
+    logWarn("定时提醒", "算提醒清单失败，这一轮提示词里不带", e);
+    return undefined;
+  }
+}
+
+/**
+ * 把这一轮输出里的提醒标记摘掉、落成条目，返回剩下的正文。
+ *
+ * 存档和上下文里留原文（调用方的 recorded 是没摘过的那份）—— 角色下一轮要看得见
+ * 自己设过什么。写错的、时间已经过了的：列表里记一条「已失效」，再攒一句系统提示，
+ * 对方下一条消息进来时递给角色让它重设（对方看不见，见 takeReminderHints）。
+ */
+async function takeReminders(runner, role, spaceId, peer, text) {
+  if (!role?.reminder?.enabled) return text;
+  const { rest, tags } = splitReminderTags(text);
+  if (!tags.length) return text;
+  const scope = scopeOf(runner, "定时提醒");
+  try {
+    const tz = await userTzOf(role);
+    const out = applyRoleTags(tags, {
+      roleId: role.id,
+      tz,
+      chat: { projectRefId: runner.projectRefId, spaceId, peer },
+    });
+    for (const it of out.set) {
+      logInfo(scope, `${role.name} 设了提醒：${it.date} ${it.time.slice(0, 5)} ${it.title}`);
+    }
+    for (const it of out.cancelled) logInfo(scope, `${role.name} 取消了提醒：${it.title}`);
+    const key = peerKeyOf(peer);
+    for (const f of out.failed) {
+      logWarn(scope, `${role.name} 写的提醒没设上：${f.why}`, f.raw);
+      const hint = f.cancel
+        ? `[系统提示:你写的 ${f.raw} 没生效：${f.why}]`
+        : `[系统提示:你刚才写的提醒 ${f.raw} 没设上：${f.why}。还要提醒的话，按 [YYYY年M月D日HH:MM | 要提醒的事] 重新写一次。这条提示{{user}}看不到]`;
+      if (!key) continue;
+      const list = runner.reminderHints.get(key) ?? [];
+      list.push(hint);
+      runner.reminderHints.set(key, list.slice(-5));
+    }
+  } catch (e) {
+    logError(scope, "提醒标记没能落盘（标记照样从短信里摘掉）", e);
+  }
+  return rest;
+}
+
+/**
+ * `/提醒`、`/增加纪念日`、`/增加生日`、`/提醒列表`、`/删除提醒 N` 真正干活的地方。
+ * 返回要回给对方的那句话。加的都是「用户自己的」日程，由这个角色来提醒。
+ */
+async function runReminderCommand(role, { op, args }, chat) {
+  const tz = await userTzOf(role);
+  if (op === "remindlist" || op === "reminddel") {
+    const rows = listForCommand(role.id, tz);
+    if (op === "remindlist") {
+      if (!rows.length) return "现在没有还没到点的提醒和日程。";
+      return ["还没到点的提醒和日程：", ...rows.map((it, i) => `${i + 1}. ${describeForList(it, tz)}`)].join("\n");
+    }
+    const n = Number(String(args).trim());
+    const hit = Number.isInteger(n) && n >= 1 ? rows[n - 1] : null;
+    if (!hit) return `⚠️ 没有第 ${String(args).trim() || "?"} 条。先发 /提醒列表 看编号。`;
+    // 角色设的标「已取消」留在列表里（角色下一轮能看到它没了）；自己加的直接删
+    if (hit.source === "role") patchItem(hit.id, { status: "cancelled" });
+    else removeItem(hit.id);
+    return `✅ 删掉了：${describeForList(hit, tz)}`;
+  }
+  const parsed =
+    op === "remind"
+      ? parseRemindCommand(args, { tz })
+      : parseDayCommand(op === "addanniv" ? "anniversary" : "birthday", args);
+  if (!parsed.ok) return `⚠️ ${parsed.why}`;
+  const item = addItem({ ...parsed.item, roleId: role.id, tz, ...chat });
+  const what = { anniversary: "纪念日", birthday: "生日" }[item.kind] ?? "提醒";
+  return `✅ 加好了${what}：${describeForList(item, tz)}`;
+}
+
+/** 取走攒着的「提醒没设上」系统提示。 */
+function takeReminderHints(runner, peerKey) {
+  if (!peerKey) return [];
+  const list = runner.reminderHints.get(peerKey) ?? [];
+  runner.reminderHints.delete(peerKey);
+  return list;
+}
+
+function armReminders(getConfig, runner) {
+  if (runner.reminderTimer) clearInterval(runner.reminderTimer);
+  runner.reminderTimer = setInterval(() => void reminderTick(getConfig, runner), REMINDER_TICK_MS);
+  runner.reminderTimer.unref?.();
+  // 第一跳不等满一个周期：关机期间到点的早点补上
+  setTimeout(() => void reminderTick(getConfig, runner), 5_000).unref?.();
+}
+
+/**
+ * 这一条该不该由这条线路来发。
+ *
+ *  - 角色设的：记着是在哪条线路、哪个会话里设的，就回那儿去说；角色那个开关关了就不响。
+ *  - 用户自己的：发到这个角色最近说话的那个会话（reminder.js:noteLastChat）；
+ *    一次都没记过就用这条线路手上最近那个会话。
+ */
+function reminderTarget(item, role, runner, lastChat) {
+  if (item.source === "role") {
+    if (!role.reminder?.enabled) return null;
+    if (item.projectRefId && item.projectRefId !== runner.projectRefId) return null;
+    if (!item.spaceId) return null;
+    return { spaceId: item.spaceId, peer: item.peer };
+  }
+  const lc = lastChat?.[role.id];
+  if (lc?.spaceId) {
+    if (lc.projectRefId && lc.projectRefId !== runner.projectRefId) return null;
+    return { spaceId: lc.spaceId, peer: lc.peer };
+  }
+  const last = runner.lastSpace;
+  return last?.spaceId ? { spaceId: last.spaceId, peer: last.peer } : null;
+}
+
+const humanMinutes = (n) => (n >= 60 && n % 60 === 0 ? `${n / 60}小时` : `${n}分钟`);
+
+/**
+ * 到点那一轮发给模型的提示词（只进这一次请求）和进上下文的占位符。
+ *
+ * 到点那句是用户逐字定的：「现在是你帮{{user}}设置的提醒时间：X，请根据人设发送信息，
+ * 注意不要OOC」。提前那一声要说清楚「到点还会再叫你」—— 不然「帮宝宝点早餐」那种，
+ * 模型提前十分钟就把单下了，到点又下一单。
+ */
+function reminderInput(item, stage, occ, tz) {
+  // 自定义类型带上用户起的类型名：「吃药：维生素D」
+  const title = item.kind === "custom" && item.label ? `${item.label}：${item.title}` : item.title;
+  if (stage === "lead") {
+    const left = humanMinutes(Math.max(1, Math.round((occ - Date.now()) / 60_000)));
+    const when = fmtWhen(occ, tz);
+    const toModel =
+      item.source === "role"
+        ? `[系统提示:再过${left}（${when}）就是你帮{{user}}设置的提醒：${title}。现在先提前跟{{user}}说一声，请根据人设发送信息，注意不要OOC。到点还会再叫你一次，要办的事（比如点单）等到点再办，这次只提醒]`
+        : `[系统提示:再过${left}（${when}）是{{user}}自己设的日程：${title}。现在先提前提醒{{user}}一声，请根据人设发送信息，注意不要OOC]`;
+    return { toModel, toHistory: `[触发了提前提醒：${title}]`, label: "提前提醒" };
+  }
+  let toModel;
+  if (item.source === "role") {
+    toModel = `[系统提示:现在是你帮{{user}}设置的提醒时间：${title}，请根据人设发送信息，注意不要OOC]`;
+  } else if (item.kind === "birthday" || item.kind === "anniversary") {
+    const p = localParts(occ, tz);
+    const day = specialName(item, `${p.y}-${String(p.m).padStart(2, "0")}-${String(p.d).padStart(2, "0")}`);
+    toModel = `[系统提示:今天是${day}，请根据人设给{{user}}发消息，注意不要OOC]`;
+  } else {
+    toModel = `[系统提示:现在是{{user}}自己设的日程提醒时间：${title}，请根据人设提醒{{user}}，注意不要OOC]`;
+  }
+  return { toModel, toHistory: `[触发了提醒：${title}]`, label: "提醒" };
+}
+
+/**
+ * 先记账再开口。返回 false = 这一下已经有人记过了（同一个角色挂在两条线路上，
+ * 另一条的心跳抢先了），这边就别再发。
+ */
+function markReminder(id, stage, occ) {
+  let ok = false;
+  updateReminders((s) => {
+    const it = s.items.find((x) => x.id === id);
+    if (!it || it.status !== "pending") return false;
+    const now = Date.now();
+    if (stage === "lead") {
+      if (it.leadFor === occ) return false;
+      it.leadFor = occ;
+    } else {
+      if (it.handledUntil && it.handledUntil > occ) return false;
+      it.handledUntil = occ + 1000;
+      if (stage === "due") it.firedAt = now;
+      if (it.repeat?.type === "once") it.status = stage === "due" ? "done" : "missed";
+    }
+    it.updatedAt = now;
+    ok = true;
+  });
+  return ok;
+}
+
+/**
+ * 心跳：这条线路上的角色有没有该响的提醒。
+ *
+ * 用户定的：无视勿扰（提醒是自己要的）；过点 30 分钟内补发，再早的标「已错过」。
+ * 线下模式 / 提示词协助模式开着时先不说 —— 那会儿角色不在线上，等结束了再说，
+ * 拖过了 30 分钟就算错过。
+ */
+async function reminderTick(getConfig, runner) {
+  if (runner.stopped || runner.reminderBusy) return;
+  runner.reminderBusy = true;
+  const scope = scopeOf(runner, "定时提醒");
+  try {
+    const role = currentRole(getConfig(), runner);
+    if (!role) return;
+    const state = loadReminders();
+    const mine = state.items
+      .filter((it) => it.status === "pending" && it.notify && (!it.roleId || it.roleId === role.id))
+      .map((it) => ({ it, target: reminderTarget(it, role, runner, state.lastChat) }))
+      .filter((x) => x.target);
+    if (!mine.length) return;
+    const userTz = await userTzOf(role);
+
+    for (const { it, target } of mine) {
+      if (runner.stopped) return;
+      // 角色设的一次性提醒按设的那一刻的时区算（标记里写的就是那时候 {{user}} 那边的钟点）
+      const tz = it.repeat.type === "once" && it.tz ? it.tz : userTz;
+      const act = dueAction(it, Date.now(), tz, state.settings);
+      if (!act.stage) continue;
+
+      if (act.stage === "missed") {
+        if (markReminder(it.id, "missed", act.occ)) {
+          logInfo(scope, `「${it.title}」${fmtWhen(act.occ, tz)} 到点时没在线，过了半小时以上，不补了`);
+        }
+        continue;
+      }
+      if (isOfflineOn(memoryKeyFor(role)) || isAssistOn(runner.projectRefId, target.spaceId)) continue;
+
+      const slot = {
+        space: runner.lastSpace?.spaceId === target.spaceId ? runner.lastSpace.space : null,
+        peer: target.peer || target.spaceId,
+      };
+      if (!(await ensureSpace(runner, slot, target.spaceId))) continue;
+      if (!markReminder(it.id, act.stage, act.occ)) continue;
+
+      const lead = act.stage === "lead" ? `（提前 ${leadOf(it, state.settings)} 分钟）` : "";
+      logInfo(scope, `${act.stage === "lead" ? "提前提醒" : "到点提醒"}「${it.title}」${lead}`);
+      await chain(
+        runner,
+        target.spaceId,
+        () => runProactiveTurn(getConfig, runner, slot, target.spaceId, reminderInput(it, act.stage, act.occ, tz)),
+        "提醒发送出错"
+      );
+    }
+  } catch (e) {
+    logError(scope, "提醒心跳出错，下一跳再看", e);
+  } finally {
+    runner.reminderBusy = false;
+  }
+}
+
+/* ================= 共感娃娃（连手机、认拥抱都在 doll.js） ================= */
+
+/**
+ * 没在听的时候隔多久回头看一眼配置。
+ *
+ * 功能没开、手机地址没填、一个角色都没开 —— 这几种情况下不该按
+ * `intervalMs` 那个频率空转，但也不能彻底不看：用户随时可能在面板上打开，
+ * 那之后最多等这么久就开始听。
+ */
+const HUG_IDLE_MS = 5_000;
+
+/**
+ * 连不上的时候，同一个原因隔多久才再说一次。
+ *
+ * 这条心跳是几百毫秒一跳的，手机一息屏就是每秒两三条「超过 3 秒没响应」——
+ * 不节流的话一夜之间日志里什么都找不着了。原因变了（从「没响应」变成
+ * 「连接被掐断」）立刻说一次，那通常意味着情况变了。
+ */
+const HUG_ERR_QUIET_MS = 60_000;
+
+/**
+ * 娃娃那条轮询，**整个进程一份**。
+ *
+ * 为什么不像提醒那样挂在 runner 上：玩偶里只有**一部**手机。按 runner 开的话，
+ * 两个角色就是两条轮询同时去打同一个地址 —— 而 phyphox 那个服务器是单线程
+ * 的（见 doll.js 文件头），请求会排队，排到后来每一跳都慢。而且两条轮询各
+ * 持一份 `since`，同一批样本会被两边各读一遍，喂进两个状态机。
+ *
+ * 所以这里是「一处听、认出来再分发」：谁开了 `role.hug.enabled` 就各收一句，
+ * 冷却仍然按角色各算（那是每个角色的性格，见 config.js:normalizeHug）。
+ */
+const dollWatcher = {
+  /*
+   * 「这条轮询开着吗」要用一个**独立的标志**，不能看 timer 是不是空的 ——
+   * 每一跳跑之前 timer 就被置回 null 了（它已经触发完了），那一瞬间进来
+   * 第二条连接的 armHug 会以为没人在跑，于是又起一条 loop，从此两条并行。
+   */
+  running: false,
+  timer: null,
+  busy: false,
+  state: createDollState(), // 状态机，见 doll.js:feedDollSamples
+  err: { why: "", at: 0 }, // 连不上时的日志节流
+  lastPushAt: 0, // 推送模式下最后一包到的时刻，判「手机不发了」用（见 hugTick）
+};
+
+/** 整个进程的娃娃轮询日志都走这个分类（不属于哪条线路）。 */
+const HUG_SCOPE = "共感娃娃";
+
+/** 停掉娃娃轮询。停完所有连接时调（见 stopAllBridges）。 */
+function stopDollWatcher() {
+  dollWatcher.running = false;
+  if (dollWatcher.timer) clearTimeout(dollWatcher.timer);
+  dollWatcher.timer = null;
+  dollWatcher.state = createDollState();
+}
+
+/**
+ * 开起娃娃轮询。重复调用是安全的（已经在跑就什么都不做）—— 每条连接起来时
+ * 都会调一次，而它们共用这一条。
+ *
+ * 用自递归的 setTimeout 而不是 setInterval：间隔是**配置项**
+ * （`dollApi.intervalMs`），用户在面板上改完下一跳就按新的走，不用重启；
+ * 而且这样天然不会出现「上一跳还没回来下一跳就排上了」。
+ */
+function armHug(getConfig) {
+  if (dollWatcher.running) return;
+  dollWatcher.running = true;
+  const loop = async () => {
+    dollWatcher.timer = null;
+    if (!dollWatcher.running) return;
+    let wait = HUG_IDLE_MS;
+    try {
+      wait = await hugTick(getConfig);
+    } catch (e) {
+      // hugTick 自己兜了错，这儿只兜「兜错的时候又错了」
+      logError(HUG_SCOPE, "娃娃心跳出错，下一跳再看", e);
+    }
+    /*
+     * 停没停只看 running 标志（stopAllBridges → stopDollWatcher 会放掉它）。
+     *
+     * 以前还加了一条「一条连接都没有就停」。推送模式下这不对：推送口不依赖
+     * iMessage 连接，连接还没起来、或者在本地起后端做自测时，手机照样在推，
+     * 「手机不发了就结算」这件事照样得有人盯。定时器是 unref 过的，不挡进程退出。
+     */
+    if (!dollWatcher.running) return;
+    dollWatcher.timer = setTimeout(() => void loop(), wait);
+    dollWatcher.timer.unref?.();
+  };
+  // 第一跳稍等一下：刚连上那一刻主连接还在补消息，别再叠一条轮询上去
+  dollWatcher.timer = setTimeout(() => void loop(), 3_000);
+  dollWatcher.timer.unref?.();
+}
+
+/** 现在有哪些角色在听。一个都没有就不必去打扰那部手机。 */
+function hugListeners(config) {
+  const out = [];
+  for (const runner of runners.values()) {
+    if (runner.stopped) continue;
+    const role = currentRole(config, runner);
+    if (role?.hug?.enabled) out.push({ runner, role });
+  }
+  return out;
+}
+
+/**
+ * 跑一跳：拉一把样本喂给状态机，认出来的拥抱分发给每个在听的角色。
+ *
+ * @returns {Promise<number>} 下一跳等多久（毫秒）
+ */
+async function hugTick(getConfig) {
+  if (dollWatcher.busy) return HUG_IDLE_MS;
+  const config = getConfig();
+  const api = config.dollApi ?? {};
+  const listeners = hugListeners(config);
+
+  /*
+   * 三道闸都得过：功能开着、手机地址填了、至少一个角色在听。
+   *
+   * 任一条不过就**把状态机清掉**再退 —— 不然用户关掉开关、过一会儿再打开，
+   * 中间那段时间的 `since` 还留着，第一跳会把这段时间里积的几万个样本一口气
+   * 读回来，变成一次「抱了二十分钟」。
+   */
+  /*
+   * **推送模式下这条循环绝对不能碰状态机。**
+   *
+   * 两种模式共用 dollWatcher.state。这里原先把 `mode === "push"` 也算进
+   * 「闸没过」那一堆，顺手把状态清掉 —— 于是推送模式下每 5 秒状态就被抹一次：
+   * 刚认出「有动静了」，没等到「放下」就被清空，永远结算不了。实机日志就是
+   * 一串「有动静了」，每行隔 5~6 秒，后面既没有「被抱了一下」也没有「不算抱」。
+   *
+   * 推送模式下这条循环只干一件事：手机不发数据了、状态还停在「抱着」，
+   * 就地结算（见 doll.js:flushSilentHold）。
+   */
+  if (api.mode === "push") {
+    // 没人在听也照样结算（和推送口一个规矩），分发那边会说「没人在听」
+    if (api.enabled) {
+      const silentMs = Math.max(api.quietMs ?? 4000, 2000) + (api.pushInterval ?? 2) * 1000 * 2;
+      const hug = flushSilentHold(dollWatcher.state, api, dollWatcher.lastPushAt, silentMs);
+      if (hug) dispatchHugs(getConfig, [hug], listeners);
+    }
+    return 1_000;
+  }
+
+  if (!api.enabled || !api.host || !listeners.length) {
+    if (dollWatcher.state.since != null) dollWatcher.state = createDollState();
+    return HUG_IDLE_MS;
+  }
+
+  dollWatcher.busy = true;
+  try {
+    const state = dollWatcher.state;
+    const page = await fetchDollSamples(api.host, {
+      magnitude: api.magnitude,
+      time: api.time,
+      cover: api.cover,
+      since: state.since,
+    });
+    // 连上了就把上一次的报错清掉，下次断了会立刻说一声
+    dollWatcher.err = { why: "", at: 0 };
+
+    /*
+     * 实验停着：手机上开着 phyphox 但没点播放，或者用户自己点了停。替他按一下
+     * （节流过的，见 doll.js:shouldTryStart）。这一跳就到这儿 —— buffer 里是
+     * 上一次测量的旧数据，feedDollSamples 会把它全丢掉。
+     */
+    if (!page.measuring) {
+      feedDollSamples(state, page, api);
+      if (api.autoStart && shouldTryStart(state)) {
+        const ok = await startDollMeasuring(api.host);
+        logInfo(
+          HUG_SCOPE,
+          ok ? "手机上的实验停着，已经替你按了开始" : "手机上的实验停着，按开始没成（去 phyphox 里点一下播放）"
+        );
+      }
+      return Math.max(api.intervalMs ?? 400, 1_000);
+    }
+
+    const hugs = feedDollSamples(state, page, api);
+    /*
+     * 挨个递、不并发：每个角色都是一整轮模型调用，各自要 ensureSpace、各自
+     * 排进自己那条 chain。并发只会让几条线路同时去抢同一批资源。
+     */
+    for (const hug of hugs) {
+      for (const { runner, role } of listeners) {
+        if (runner.stopped) continue;
+        await deliverHug(getConfig, runner, role, hug);
+      }
+    }
+    return api.intervalMs ?? 400;
+  } catch (e) {
+    /*
+     * 连不上不是「出错」，是常态的一种：手机息屏、走出 WiFi、phyphox 被切到
+     * 后台。所以不 logError（那会在界面上变成一条红的），只按原因节流地
+     * logWarn 一句，而且**退到 idle 的节奏**去重试 —— 手机不在的时候没必要
+     * 每 400ms 敲一次门。
+     */
+    const why = String(e?.message ?? e);
+    const now = Date.now();
+    if (dollWatcher.err.why !== why || now - dollWatcher.err.at > HUG_ERR_QUIET_MS) {
+      logWarn(HUG_SCOPE, `连不上手机上的 phyphox：${why}`);
+      dollWatcher.err = { why, at: now };
+    }
+    return HUG_IDLE_MS;
+  } finally {
+    dollWatcher.busy = false;
+  }
+}
+
+/**
+ * 推送模式：手机自己把一包样本 POST 过来了。
+ *
+ * 和拉模式**共用同一个状态机**（dollWatcher.state）—— 两条路喂进去的都是
+ * 「一把带时间戳的样本」，所以阈值、冷却、那句话的拼法全都照旧，没有第二套
+ * 判定逻辑。两条路同时开着也不会打架：拉那边在 `mode === "push"` 时根本不跑
+ * （见 hugTick）。
+ *
+ * 由 index.js 那条 webhook 路由调（secret 已经在那边验过了）。
+ *
+ * @param {object} payload parseDollPush 的结果
+ * @returns {Promise<{hugs:number, listeners:number}>} 这包认出几次拥抱、递给了几个角色
+ */
+export function handleDollPush(getConfig, payload) {
+  /*
+   * 盯「手机不发了」的那条循环平时由 iMessage 连接起来时带起来。推送口不依赖
+   * 连接，所以这里也带一下 —— 已经在跑就什么都不做。
+   */
+  armHug(getConfig);
+  const config = getConfig();
+  const api = config.dollApi ?? {};
+  const listeners = hugListeners(config);
+
+  /*
+   * **没人在听也照样把数据喂进状态机**，只是不往外递。
+   *
+   * 一开始这里是「没听众就直接 return」，省事但有两处不对：
+   *
+   *  - 桥接掉线重连那几十秒里，样本被整包扔掉，而用户正抱着。连上之后
+   *    状态机还停在几十秒前，下一包的时间对不上，又要走一遍「是不是重来了」；
+   *  - 更要命的是**没法验证**：本地起一个后端是没有 iMessage 连接的，
+   *    于是听众永远是 0，推什么进去都石沉大海，连「认出几次拥抱」都看不到。
+   *    这个功能实机上连着踩坑却难查，有一半就是因为这条路验不了。
+   *
+   * 喂一遍很便宜（纯算术），而且状态连续才是对的。
+   *
+   * ── 另外两件事 ──
+   *
+   * 推模式没有 `measuring` / `session` 可问（那两样是远程接口才有的）。
+   * 能收到这包本身就说明手机在测量，所以这里直接拿 `true` 和一个固定的
+   * session 喂进去 —— 换实验这件事在推模式下表现为「对方换了实验文件」，
+   * 那会导致时间轴归零，状态机里有一条专门认它（见 feedDollSamples）。
+   *
+   * **喂状态机这一步是同步的，就在请求里做完。** 它很快，而且只有这样才能
+   * 保证「按到达顺序喂」—— 中间一旦 await，下一个请求就会插进来改同一份状态。
+   */
+  dollWatcher.lastPushAt = Date.now();
+  const hugs = feedDollSamples(
+    dollWatcher.state,
+    { session: "push", measuring: true, samples: payload.samples, cover: payload.cover },
+    api
+  );
+
+  /*
+   * **递送不能让这个 HTTP 请求等着。**
+   *
+   * 递一次拥抱 = 一整轮模型调用，实测十几秒。而手机是每两秒推一包的：
+   * 吊着不回的话，后面的请求就在手机那头排起队，然后几个一起涌进来、
+   * 处理顺序还不一定和发出顺序一致。于是状态机会收到一包「时间比上次还早」
+   * 的样本，把它当成「用户在手机上清空了实验」，整个状态推倒重来 ——
+   * 日志里一秒钟刷四条「实验时间归零了」就是这么来的，正在进行的那次
+   * 拥抱也跟着被丢掉。
+   *
+   * 所以这里排进一条链就撒手，HTTP 立刻回 200。链是为了让几次拥抱按顺序
+   * 递，而不是一拥而上。
+   */
+  dispatchHugs(getConfig, hugs, listeners);
+  return { hugs: hugs.length, listeners: listeners.length };
+}
+
+/**
+ * 把认出来的几次拥抱排进递送链。推送口和「手机不发了」的结算共用这一份。
+ */
+function dispatchHugs(getConfig, hugs, listeners) {
+  if (hugs.length && !listeners.length) {
+    /*
+     * 认出来了却没人听。这**不是**调试信息，是用户会真撞上的一种：角色那边
+     * 开关是开的，但这条 iMessage 连接还没起来（刚启动、或者掉线重连中）。
+     * 不说的话，他抱了一下、控制台一片安静，又要从头猜一遍。
+     */
+    logWarn(HUG_SCOPE, `认出 ${hugs.length} 次拥抱，但这会儿没有角色在听（连接还没起来？角色那个开关关着？）`);
+  }
+  for (const hug of hugs) {
+    for (const { runner, role } of listeners) {
+      if (runner.stopped) continue;
+      hugDelivery = hugDelivery
+        .then(() => (runner.stopped ? null : deliverHug(getConfig, runner, role, hug)))
+        .catch((e) => logError(scopeOf(runner, "共感娃娃"), "递送拥抱时出错", e));
+    }
+  }
+}
+
+/**
+ * 递送拥抱的那条链。
+ *
+ * 推送口收到数据就立刻回 200（理由见 handleDollPush），真正的递送排在这儿
+ * 一个一个来 —— 每次都是一整轮模型调用，几个角色一拥而上只会互相抢资源。
+ */
+let hugDelivery = Promise.resolve();
+
+/**
+ * 这一下该说给哪个会话。
+ *
+ * 拥抱不属于哪个聊天 —— 用户抱的是玩偶，不是在某条对话里点了什么。所以照
+ * 「用户自己设的提醒」那条分支走（reminderTarget 的后半段）：发到这个角色
+ * 最近说话的那个会话，一次都没记过就用这条线路手上最近那个。
+ */
+function hugTarget(role, runner, lastChat) {
+  const lc = lastChat?.[role.id];
+  if (lc?.spaceId) {
+    if (lc.projectRefId && lc.projectRefId !== runner.projectRefId) return null;
+    return { spaceId: lc.spaceId, peer: lc.peer };
+  }
+  const last = runner.lastSpace;
+  return last?.spaceId ? { spaceId: last.spaceId, peer: last.peer } : null;
+}
+
+/**
+ * 递一次拥抱：拼那句系统提示，借主动消息那条路让角色开口。
+ *
+ * 和提醒走的是同一条路（`runProactiveTurn` 带 override），所以同样**不看
+ * 主动消息的开关**，也同样无视勿扰时段 —— 用户是刚刚亲手抱了一下，这会儿
+ * 不回应才叫坏掉。
+ */
+async function deliverHug(getConfig, runner, role, hug) {
+  const scope = scopeOf(runner, "共感娃娃");
+  const api = getConfig().dollApi ?? {};
+  const cfg = role.hug ?? {};
+  const cd = (cfg.cooldownMinutes ?? 10) * 60_000;
+  const now = Date.now();
+
+  /*
+   * 冷却期内的不另起一轮，只把次数攒起来。
+   *
+   * 揉着玩偶玩会连出好几次拥抱，一次就是一整轮模型调用。攒着而不是丢掉，
+   * 是因为「这之前还抱过 5 次」本身是有信息的 —— 见 doll.js:renderHugLine
+   * 里的 `{{次数}}`。
+   */
+  if (cd && now < runner.hugCooldownUntil) {
+    runner.hugPending += 1;
+    const left = Math.max(1, Math.round((runner.hugCooldownUntil - now) / 60_000));
+    /*
+     * **这条必须是 logInfo，不能是 logDebug。**
+     *
+     * 从用户那头看，「冷却期内被压下」和「压根没认出来」长得一模一样：都是
+     * 抱了一下、角色没反应。控制台上一个字都不说的话，他只会以为功能坏了，
+     * 然后去查手机、查网络、查阈值 —— 而真相只是「十分钟内已经说过一次了」。
+     * 实机上就这么发生过。
+     */
+    logInfo(
+      scope,
+      `又被抱了一下（${hugDurationLog(hug)}），但还在冷却里（还有 ${left} 分钟），` +
+        `这次不另起一轮、攒着下次一起说（已攒 ${runner.hugPending} 次）`
+    );
+    return;
+  }
+
+  // 「这个角色最近在哪说话」记在提醒那份存档里（reminder.js:noteLastChat）
+  const reminders = loadReminders();
+  const target = hugTarget(role, runner, reminders.lastChat);
+  if (!target) {
+    /*
+     * 还没有过任何对话，不知道该发到哪儿。**攒着不丢**：用户很可能是先配好
+     * 娃娃、抱着试了几下，然后才去跟角色说第一句话 —— 那几下该算数。
+     * 冷却这时候不置上（这一次压根没发出去）。
+     */
+    runner.hugPending += 1;
+    logWarn(scope, `被抱了一下，但还不知道该发到哪个聊天里（先跟角色说句话，之后就有了），攒到第 ${runner.hugPending} 次`);
+    return;
+  }
+
+  /*
+   * 线下模式 / 提示词协助模式开着时角色不在线上，这会儿不能开口 —— 和提醒
+   * 那边一个待遇，区别是**攒着不丢**：线下结束之后下一次拥抱会把这几次
+   * 一起说出来。
+   */
+  if (isOfflineOn(memoryKeyFor(role)) || isAssistOn(runner.projectRefId, target.spaceId)) {
+    runner.hugPending += 1;
+    // 同样用 logInfo：不说的话，用户只看到「抱了没反应」，看不出是被什么挡住的
+    logInfo(scope, `被抱了一下，但这会儿不在线上（线下 / 协助模式），攒着下次一起说（已攒 ${runner.hugPending} 次）`);
+    return;
+  }
+
+  const slot = {
+    space: runner.lastSpace?.spaceId === target.spaceId ? runner.lastSpace.space : null,
+    peer: target.peer || target.spaceId,
+  };
+  if (!(await ensureSpace(runner, slot, target.spaceId))) return;
+
+  const times = runner.hugPending;
+  const toModel = renderHugLine(cfg.template, {
+    durationMs: hug.durationMs,
+    peak: hug.peak,
+    times,
+    opts: api,
+  });
+  if (!toModel.trim()) {
+    logWarn(scope, "那句系统提示的文案是空的，这次不发");
+    return;
+  }
+
+  /*
+   * 先记账再开口：冷却从**发之前**算起，而且先清掉攒的次数。
+   *
+   * 顺序反了的话，这一轮模型调用（十几秒）期间再被抱几下，会因为冷却还没
+   * 置上而又起一轮；次数也会被这一轮发出去的那句话重复带上。
+   */
+  runner.hugCooldownUntil = cd ? Date.now() + cd : 0;
+  runner.hugPending = 0;
+
+  logInfo(scope, `被抱了一下（${hugDurationLog(hug)}）${times ? `，连上之前攒的 ${times} 次` : ""}`);
+  await chain(
+    runner,
+    target.spaceId,
+    () =>
+      runProactiveTurn(getConfig, runner, slot, target.spaceId, {
+        toModel,
+        /*
+         * 存进上下文的就是发给模型的那一整句，不用占位符。
+         *
+         * 提醒那边存的是 `[触发了提醒：X]` 这种短占位，因为它的提示词很长，
+         * 每轮都跟着历史重发太浪费。这句不一样：它本来就短，而且里面的
+         * 时长、力度、次数是**这件事本身**——角色之后翻上下文，该看得到
+         * 「那次抱了 8 秒、很用力」，而不是一句没信息量的「被抱了一下」。
+         * 用户看到存档里只有占位符，也问过「为什么不是那句系统提示」。
+         *
+         * `{{user}}` 照旧留字面量，拼提示词时由 applyVars 换。
+         */
+        toHistory: toModel,
+        label: "共感娃娃",
+        scope: "共感娃娃",
+      }),
+    "共感娃娃那一轮出错"
+  );
+}
+
+/** 日志里那一小段「多久、多重」。给人排阈值用的，所以峰值要原始数字。 */
+function hugDurationLog(hug) {
+  return `${Math.round(hug.durationMs / 1000)} 秒、峰值 ${hug.peak.toFixed(2)}`;
 }
 
 /**
@@ -5554,6 +6688,483 @@ async function claimTransferOnReact(runner, role, message, scope) {
   return { amount: hit.amount, note: hit.note, currency: hit.currency };
 }
 
+/* ================= 点单：瑞幸 / 麦当劳（见 luckin.js、mcd.js） ================= */
+
+/** 卡片右上角那行状态字。 */
+const ORDER_STATE_LABEL = {
+  pending: "待确认",
+  ordered: "已下单 · 待支付",
+  ready: "待取餐",
+  expired: "已失效",
+  failed: "下单失败",
+  cancelled: "已取消",
+};
+
+/**
+ * 两家的差别都收在这张表里，下面发卡、确认、注入提示词是同一套代码。
+ *
+ * 订单记录上的 `brand` 指回这里；1.14.0 早期存的瑞幸订单没有这个字段，按 luckin 算。
+ */
+const ORDER_BRANDS = {
+  luckin: {
+    label: "瑞幸",
+    app: "瑞幸咖啡",
+    what: "喝的",
+    draft: (config, spec, loc, scope) => draftOrder(config, spec, loc, scope),
+    place: (config, draft, scope) => placeOrder(config, draft, scope),
+    cancel: (config, orderId, scope) => cancelLuckinOrder(config, orderId, scope),
+    menu: (config, loc, role, scope) => autoMenuText(config, loc, scope),
+    wanted: (history) => luckinWanted(history),
+    // 瑞幸没有收货地址，一定要知道人在哪儿才能找店
+    needsLoc: true,
+  },
+  mcd: {
+    label: "麦当劳",
+    app: "麦当劳",
+    what: "吃的",
+    draft: (config, spec, loc, scope, role, user) =>
+      draftMcdOrder(
+        config,
+        spec,
+        { addressId: role?.mcd?.addressId, addressHint: user?.address, claim: role?.mcd?.autoCoupon !== false },
+        scope
+      ),
+    place: (config, draft, scope) => placeMcdOrder(config, draft, scope),
+    cancel: (config, orderId, scope) => cancelMcdOrder(config, orderId, scope),
+    menu: (config, loc, role, scope, user) =>
+      autoMcdMenuText(
+        config,
+        { addressId: role?.mcd?.addressId, addressHint: user?.address, claim: role?.mcd?.autoCoupon !== false },
+        role?.mcd?.mode === "pickup" ? "到店" : "外送",
+        scope
+      ),
+    wanted: (history) => mcdWanted(history),
+    // 外送用账号里的地址、到店先看收藏的门店，位置只是兜底
+    needsLoc: false,
+  },
+};
+
+const brandOf = (order) => (order?.brand === "mcd" ? "mcd" : "luckin");
+
+/** 订单卡片上方那行小字，空着兜底。和转账一样，发和改要算出同一个值。 */
+const orderAppName = (brand, name) => String(name ?? "").trim() || ORDER_BRANDS[brand].app;
+
+/**
+ * 一单拼成 MiniAppLayout。槽位和转账卡片一样是苹果钉死的，只决定往哪个槽放什么：
+ *
+ *   caption            瑞幸 ¥16.90 / 麦当劳 ¥38.50
+ *   subcaption         生椰拿铁 大杯/少冰 ×1 · 备注：不要吸管
+ *   trailingCaption    待确认 / 已下单 · 待支付 / 待取餐 …
+ *   trailingSubcaption 门店名（外送写「外送 · 门店」；查到取餐码之后换成取餐码）
+ *
+ * 上面那张图是品牌 logo（orderlogos.js）。proto 要求 image 和 imageTitle 一起给，
+ * imageTitle 和顶层 appName 用同一个值，卡片上下不会写两样。
+ */
+function orderLayout(order) {
+  const brand = brandOf(order);
+  const b = ORDER_BRANDS[brand];
+  const label = ORDER_STATE_LABEL[order.state] ?? order.state;
+  const items = linesText(order.lines);
+  // 备注放在最前面，商品跟在后面（槽位不够长时先截掉的是商品尾巴，不是这句话）
+  const note = order.remark ? `「${order.remark}」 ` : "";
+  const where = order.orderType === 2 ? `外送 · ${order.shopName}` : order.shopName;
+  const tail = order.pickupCode ? `取餐码 ${order.pickupCode}` : where;
+  return {
+    caption: `${b.label} ${luckinMoney(order.total)}`,
+    subcaption: `${note}${items}`.slice(0, 160),
+    trailingCaption: label,
+    ...(tail ? { trailingSubcaption: String(tail).slice(0, 60) } : {}),
+    image: orderLogo(brand),
+    imageTitle: orderAppName(brand, order.appName),
+    summary: `${b.label}订单 ${luckinMoney(order.total)} · ${note}${items}（${label}）`.slice(0, 300),
+  };
+}
+
+/** 这一单按哪儿找店：对方最近发来的位置 > 「查找」共享过来的位置 > 「你」设置里的地址。 */
+async function luckinLocation(runner, ctx, scope) {
+  const key = peerKeyOf(ctx?.peer ?? "");
+  const found = runner.locLast?.get(key);
+  const live =
+    runner.luckinLoc?.get(key) ?? (hasFix(found) ? { lat: found.latitude, lon: found.longitude } : null);
+  const user = resolveUser(ctx?.config, ctx?.role);
+  return resolveLocation(live, user?.address, scope);
+}
+
+/**
+ * 对方消息里带了位置（地图链接已经被 renderMapsLinks 换成 `[location:名:纬,经]`）就记下来，
+ * 下一单按这儿找店。只在内存里 —— 位置是会变的，重启后退回设置里的地址正合适。
+ */
+function notePeerLocation(runner, peer, text) {
+  const m = /[[［]\s*location\s*[:：][^\]］]*?[:：]\s*(-?\d{1,3}\.\d+)\s*[,，]\s*(-?\d{1,3}\.\d+)\s*[\]］]/i.exec(
+    String(text ?? "")
+  );
+  if (m) runner.luckinLoc?.set(peerKeyOf(peer), { lat: Number(m[1]), lon: Number(m[2]) });
+}
+
+/** 下完单多久之内算「刚点过」，这段时间里不再带菜单和完整说明。 */
+const ORDER_DONE_MS = 3 * 3600_000;
+
+/**
+ * 这一轮某一家那条子条目该注入什么（交给 prompt.js:formatBlock）。
+ *
+ *  - 这段对话有一张还在等确认的订单卡片 → 完整说明 + 那一单（对方说「换成热的」时角色能改）；
+ *  - 刚下过单（3 小时内）→ 只给一句话：点完就不注入了；
+ *  - 聊到了 → 完整说明，开了「自动带上菜单」就先查菜单一起放进去；
+ *  - 都不是 → 一句话。
+ *
+ * 查菜单失败不拦这一轮，当没菜单。
+ *
+ * @returns {Promise<{mode:"full"|"short"|"done", extra?:string}|undefined>} 没开这家返回 undefined
+ */
+async function orderPromptState(brand, runner, config, role, peer, history, scope) {
+  const b = ORDER_BRANDS[brand];
+  const sw = role?.[brand];
+  if (!sw?.enabled) return undefined;
+  const key = peerKeyOf(peer);
+  const mine = readOrders(memoryKeyFor(role)).filter((o) => o?.peerKey === key && brandOf(o) === brand);
+  const last = mine[mine.length - 1];
+  if (last?.state === "pending") {
+    const mins = clampInt(sw.confirmMinutes, 30, 1, 240);
+    if (Date.now() - Number(last.createdAt ?? 0) <= mins * 60_000) {
+      return {
+        mode: "full",
+        extra:
+          `现在有一张还没确认的${b.label}订单：${linesText(last.lines)}，${luckinMoney(last.total)}，${last.shopName}` +
+          `${last.remark ? `，备注「${last.remark}」` : ""}。对方要改的话重新写一个 [${b.label}:…]，新卡片会替代这张。`,
+      };
+    }
+  }
+  const doneAt = Number(last?.orderedAt ?? last?.updatedAt ?? 0);
+  if (["ordered", "ready"].includes(last?.state) && Date.now() - doneAt < ORDER_DONE_MS) {
+    // 点完就不带菜单了，只留一句：对方要退的话角色得知道怎么写
+    return {
+      mode: "done",
+      extra:
+        `你刚给对方下了一单${b.label}（${linesText(last.lines)}，${luckinMoney(last.total)}）。` +
+        `对方说不要了、点错了，就写 [取消订单:${b.label}] 帮对方取消。`,
+    };
+  }
+  if (!b.wanted(history)) return { mode: "short" };
+  if (sw.menu === false || !brandReady(config, brand)) return { mode: "full" };
+  const loc = await luckinLocation(runner, { peer, config, role }, scope);
+  if (!loc && b.needsLoc) return { mode: "full", extra: "（不知道对方在哪儿，查不了附近门店的菜单。）" };
+  try {
+    return { mode: "full", extra: await b.menu(config, loc, role, scope, resolveUser(config, role)) };
+  } catch (e) {
+    logWarn(scope, `${b.label}菜单没查到，这轮不带菜单`, e);
+    return { mode: "full" };
+  }
+}
+
+/**
+ * 执行一个 `[瑞幸:…]` / `[麦当劳:…]`：配单、算价，发一张「待确认」的订单卡片。
+ *
+ * 闸：角色开关、token、位置（瑞幸必须有）。自定义卡片只有云端（Photon）能发，本地 Mac
+ * 模式退化成一句文字报给对方看，**不下单**（那边没有「贴 emoji 确认」这条路）。
+ *
+ * 哪一步失败都不发卡片，给角色攒一句系统提示说清原因，让它自己跟对方解释 ——
+ * 「门店打烊了」「没有这款」这种话由角色说出来比一张报错卡片自然。
+ *
+ * @returns {Promise<boolean>} 发出去了没有
+ */
+async function sendOrderPart(runner, space, part, ctx) {
+  const brand = part.kind === "mcd" ? "mcd" : "luckin";
+  const b = ORDER_BRANDS[brand];
+  const scope = scopeOf(runner, b.label);
+  const role = ctx?.role;
+  const config = ctx?.config;
+  const key = peerKeyOf(ctx?.peer ?? "");
+  const fail = (why) => {
+    logWarn(scope, `这一单没配成：${why}`);
+    noteReaction(runner, key, "", "", `[系统提示:你想给{{user}}点的${b.label}没配成：${why}]`);
+    return false;
+  };
+
+  if (!role?.[brand]?.enabled) {
+    logInfo(scope, `这个角色没开「${b.label}点单」，跳过这条：[${b.label}:${part.text}]`);
+    return false;
+  }
+  if (!brandReady(config, brand)) return fail(`还没填${b.label}的 token（角色配置 → 点单）`);
+  const spec = parseOrderSpec(part.text);
+  if (!spec.items.length) return fail(`「${part.text}」里认不出要点什么`);
+  // 麦当劳：没写 @外送 / @到店 就按角色上选的默认方式
+  if (brand === "mcd" && !spec.store) spec.store = role.mcd.mode === "pickup" ? "到店" : "外送";
+
+  const loc = await luckinLocation(runner, ctx, scope);
+  if (!loc && b.needsLoc) return fail("不知道{{user}}在哪儿 —— 让{{user}}发个位置，或者在「你」的设置里填地址");
+
+  let draft;
+  try {
+    draft = await b.draft(config, spec, loc, scope, role, resolveUser(config, role));
+  } catch (e) {
+    return fail(String(e?.message ?? e));
+  }
+  const order = { ...draft, brand, state: "pending", createdAt: Date.now(), peerKey: key };
+  logInfo(
+    scope,
+    `配好一单：${linesText(order.lines)}，${luckinMoney(order.total)}，${order.shopName}` +
+      `${order.remark ? `，备注「${order.remark}」` : ""}${loc ? `（按${loc.from}）` : ""}`
+  );
+
+  if (runner.mode !== "cloud") {
+    noteSent(
+      runner,
+      ctx,
+      await space.send(`${b.label} ${luckinMoney(order.total)}：${linesText(order.lines)}（${order.shopName}）`)
+    );
+    noteReaction(runner, key, "", "", "[系统提示:本地模式发不了订单卡片，这一单只是报给{{user}}看，没有下单]");
+    return true;
+  }
+
+  const appName = orderAppName(brand, role[brand].appName);
+  const session = await sendLayoutCard({
+    projectId: runner.projectId,
+    projectSecret: runner.projectSecret,
+    chatGuid: ctx?.spaceId ?? "",
+    appName,
+    layout: orderLayout({ ...order, appName }),
+    what: `${b.label}订单卡片`,
+    scope,
+  });
+  if (!session) return fail("订单卡片没发出去（看控制台日志）");
+  if (!putOrder(memoryKeyFor(role), { ...session, ...order, appName })) {
+    logWarn(scope, "这一单没存下来，对方点回应也下不了单");
+  }
+
+  const extra = order.missed.length ? `；${order.missed.join("；")}` : "";
+  const fee = order.delivery ? `（含配送费 ${luckinMoney(order.delivery)}）` : "";
+  noteReaction(
+    runner,
+    key,
+    "",
+    "",
+    `[系统提示:${b.label}订单卡片已发出：${linesText(order.lines)}，实付 ${luckinMoney(order.total)}${fee}，` +
+      `${order.orderType === 2 ? `外送到「${order.shopAddress}」，` : ""}${order.shopName}，等{{user}}点回应确认${extra}。` +
+      `提醒{{user}}先看看${order.orderType === 2 ? "送餐地址对不对" : "这家店是不是离自己最近、方便去取的那家"}，确认没问题再点，免得下错单]`
+  );
+  return true;
+}
+
+/** 下单后隔多久查一次取餐码、最多查几次（一分钟一次，查 45 分钟）。 */
+const LUCKIN_POLL_MS = 60_000;
+const LUCKIN_POLL_MAX = 45;
+
+/**
+ * 对方给一张订单卡片贴了 emoji → 下单、改卡片、发付款方式。
+ *
+ * 和收转账同一个位置拦（reactSend 那道闸之前，理由见 claimTransferOnReact）。
+ * 超过角色上配的确认时限就不下单、卡片改成「已失效」—— 隔久了价格和券都不作数。
+ *
+ * 付款：瑞幸给的是 `weixin://` 扫码链接，iMessage 里点不开，发它托管的二维码图；
+ * 麦当劳给的是 https 的 H5 付款页，发成链接卡片，点开就能付。
+ *
+ * @returns {Promise<boolean>} 这个 emoji 是不是冲着订单卡片来的（是的话调用方别再往下走）
+ */
+async function claimOrderOnReact(getConfig, runner, role, space, spaceId, peer, message) {
+  if (runner.mode !== "cloud") return false;
+  const target = message?.content?.target;
+  const guid = String(target?.parentId ?? target?.id ?? "").trim();
+  const roleKey = memoryKeyFor(role);
+  const hit = guid ? findOrder(roleKey, guid) : null;
+  if (!hit) return false;
+  const brand = brandOf(hit);
+  const b = ORDER_BRANDS[brand];
+  const scope = scopeOf(runner, b.label);
+  if (!role?.[brand]?.enabled) return false;
+  if (hit.state !== "pending") {
+    logDebug(scope, `这张订单卡片已经是「${ORDER_STATE_LABEL[hit.state] ?? hit.state}」了，不重复处理`);
+    return true;
+  }
+
+  const key = peerKeyOf(peer);
+  const update = async (next) => {
+    putOrder(roleKey, next);
+    await updateLayoutCard({
+      projectId: runner.projectId,
+      projectSecret: runner.projectSecret,
+      session: next,
+      appName: next.appName,
+      layout: orderLayout(next),
+      what: `${b.label}订单卡片（改成「${ORDER_STATE_LABEL[next.state]}」）`,
+      scope,
+    });
+  };
+
+  const mins = clampInt(role[brand].confirmMinutes, 30, 1, 240);
+  if (Date.now() - Number(hit.createdAt ?? 0) > mins * 60_000) {
+    await update({ ...hit, state: "expired" });
+    logInfo(scope, `订单卡片超过 ${mins} 分钟才确认，按失效处理，没下单`);
+    noteReaction(
+      runner,
+      key,
+      "",
+      "",
+      `[系统提示:{{user}}确认得太晚，那张${b.label}订单已失效、没下单，要${b.what}的话得重新点]`
+    );
+    return true;
+  }
+
+  // 先钉成「已下单」再去下单：对方手快连贴两个 emoji 时，第二个看到的就不是 pending 了
+  putOrder(roleKey, { ...hit, state: "ordered" });
+  let paid;
+  try {
+    paid = await b.place(getConfig(), hit, scope);
+  } catch (e) {
+    const why = String(e?.message ?? e);
+    await update({ ...hit, state: "failed" });
+    logWarn(scope, `${b.label}下单失败`, e);
+    noteReaction(runner, key, "", "", `[系统提示:{{user}}确认了${b.label}订单，但下单失败：${why}]`);
+    return true;
+  }
+  const ordered = { ...hit, state: "ordered", orderId: paid.orderId, orderedAt: Date.now() };
+  await update(ordered);
+
+  let how;
+  if (brand === "mcd") {
+    const sent = paid.payUrl
+      ? await sendLinkCard(runner, space, paid.payUrl, { spaceId, peer }, scope)
+      : false;
+    how = sent ? "付款链接已经发给{{user}}，点开就能付" : "付款链接没发出去，让{{user}}去麦当劳 App 的订单里付";
+  } else {
+    let qrSent = false;
+    if (paid.qrUrl) {
+      try {
+        const res = await fetch(paid.qrUrl, { signal: AbortSignal.timeout(10_000) });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const buf = Buffer.from(await res.arrayBuffer());
+        const mimeType = res.headers.get("content-type")?.split(";")[0] || "image/png";
+        const { attachment } = await import("spectrum-ts");
+        await space.send(
+          attachment(buf, { mimeType, name: `瑞幸付款码${mimeType.includes("jpeg") ? ".jpg" : ".png"}` })
+        );
+        qrSent = true;
+      } catch (e) {
+        logWarn(scope, "付款二维码没发出去", e);
+      }
+    }
+    how = qrSent ? "付款二维码已经发给{{user}}，用微信扫码付" : "付款码没发出去，让{{user}}去瑞幸 App 的订单里付";
+  }
+  const memo = hit.remark
+    ? paid.remarkSent
+      ? `，备注「${hit.remark}」已经写进订单`
+      : `，备注「${hit.remark}」${b.label}的下单接口收不了，只在卡片上，需要的话让{{user}}自己跟店员说`
+    : "";
+  noteReaction(
+    runner,
+    key,
+    "",
+    "",
+    `[系统提示:{{user}}确认了${b.label}订单，已下单（订单号 ${paid.orderId || "未知"}），实付 ${luckinMoney(hit.total)}，${how}${memo}。` +
+      `{{user}}要是不想要了，写 [取消订单:${b.label}] 就能取消]`
+  );
+
+  // 取餐码：只有瑞幸有查订单的接口
+  if (brand === "luckin" && role.luckin.pickupNotify && paid.orderId) {
+    armLuckinPoll(getConfig, runner, roleKey, ordered, space, spaceId, peer);
+  }
+  return true;
+}
+
+/**
+ * 执行一个 `[取消订单]` / `[取消订单:瑞幸]`：取消这段对话里最近那一单已下的单。
+ *
+ * 只取消「已下单」「待取餐」的（还没确认的卡片不用取消，不点就不会下）；取消成功把卡片
+ * 改成「已取消」。取不取消得了由那家说了算（做好了、送出去了的一般取消不了），失败原话
+ * 交给角色。
+ *
+ * @returns {Promise<boolean>} 取消掉了没有
+ */
+async function cancelOrderPart(runner, space, part, ctx) {
+  const role = ctx?.role;
+  const key = peerKeyOf(ctx?.peer ?? "");
+  const want = /麦当劳|mcd/i.test(part.text) ? "mcd" : /瑞幸|luckin/i.test(part.text) ? "luckin" : "";
+  const roleKey = memoryKeyFor(role);
+  const mine = readOrders(roleKey).filter(
+    (o) =>
+      o?.peerKey === key &&
+      o.orderId &&
+      ["ordered", "ready"].includes(o.state) &&
+      (!want || brandOf(o) === want) &&
+      role?.[brandOf(o)]?.enabled
+  );
+  const hit = mine.sort((a, b) => Number(b.orderedAt ?? 0) - Number(a.orderedAt ?? 0))[0];
+  const scope = scopeOf(runner, hit ? ORDER_BRANDS[brandOf(hit)].label : "点单");
+  if (!hit) {
+    logInfo(scope, `[取消订单${part.text ? `:${part.text}` : ""}]：这段对话里没有能取消的单`);
+    noteReaction(runner, key, "", "", "[系统提示:你想取消订单，但这段对话里没有已下单、还能取消的单]");
+    return false;
+  }
+  const b = ORDER_BRANDS[brandOf(hit)];
+  try {
+    await b.cancel(ctx.config, hit.orderId, scope);
+  } catch (e) {
+    const why = String(e?.message ?? e);
+    logWarn(scope, `${b.label}订单 ${hit.orderId} 取消失败`, e);
+    noteReaction(runner, key, "", "", `[系统提示:${b.label}那一单没取消掉：${why}]`);
+    return false;
+  }
+  const next = { ...hit, state: "cancelled" };
+  putOrder(roleKey, next);
+  if (runner.mode === "cloud") {
+    await updateLayoutCard({
+      projectId: runner.projectId,
+      projectSecret: runner.projectSecret,
+      session: next,
+      appName: next.appName,
+      layout: orderLayout(next),
+      what: `${b.label}订单卡片（改成「已取消」）`,
+      scope,
+    });
+  }
+  // 取消了就别再查取餐码了
+  const poll = runner.luckinPoll?.get(`${roleKey}::${hit.messageGuid}`);
+  if (poll) clearTimeout(poll);
+  runner.luckinPoll?.delete(`${roleKey}::${hit.messageGuid}`);
+  noteReaction(runner, key, "", "", `[系统提示:${b.label}那一单（${linesText(hit.lines)}）已经取消了]`);
+  return true;
+}
+
+/**
+ * 「取餐码提醒」：隔一分钟查一次订单，查到取餐码就把卡片改成「待取餐」、让角色说一句。
+ *
+ * 只活在内存里：重启就不查了。查 45 次（45 分钟）还没有多半是没付款，停。
+ */
+function armLuckinPoll(getConfig, runner, roleKey, order, space, spaceId, peer) {
+  const scope = scopeOf(runner, "瑞幸");
+  const id = `${roleKey}::${order.messageGuid}`;
+  let tries = 0;
+  const tick = async () => {
+    runner.luckinPoll?.delete(id);
+    if (runner.stopped) return;
+    tries += 1;
+    try {
+      const { code } = await orderStatus(getConfig(), order.orderId, scope);
+      if (code) {
+        const next = { ...order, state: "ready", pickupCode: code };
+        putOrder(roleKey, next);
+        await updateLayoutCard({
+          projectId: runner.projectId,
+          projectSecret: runner.projectSecret,
+          session: next,
+          appName: next.appName,
+          layout: orderLayout(next),
+          what: "瑞幸订单卡片（取餐码）",
+          scope,
+        });
+        logInfo(scope, `查到取餐码 ${code}`);
+        const hint = `[系统提示:瑞幸那一单可以取了，取餐码 ${code}，门店 ${order.shopName}]`;
+        enqueue(getConfig, runner, space, spaceId, { text: hint }, peer);
+        return;
+      }
+    } catch (e) {
+      logDebug(scope, `查订单状态失败：${String(e?.message ?? e)}`);
+    }
+    if (tries < LUCKIN_POLL_MAX) runner.luckinPoll?.set(id, setTimeout(tick, LUCKIN_POLL_MS));
+    else logInfo(scope, "查了 45 分钟还没有取餐码（多半没付款），不查了");
+  };
+  runner.luckinPoll?.set(id, setTimeout(tick, LUCKIN_POLL_MS));
+}
+
 /**
  * 执行一个 `[music:歌手-歌名]`：查出真实链接，发成一张音乐卡片。
  *
@@ -6252,6 +7863,8 @@ async function sendBubbles(runner, space, chat, text, ctx = {}) {
       else if (part.kind === "music") ok = await sendMusicPart(runner, space, part, ctx);
       else if (part.kind === "location") ok = await sendLocationPart(runner, space, part, ctx);
       else if (part.kind === "transfer") ok = await sendTransferPart(runner, space, part, ctx);
+      else if (part.kind === "luckin" || part.kind === "mcd") ok = await sendOrderPart(runner, space, part, ctx);
+      else if (part.kind === "cancel_order") ok = await cancelOrderPart(runner, space, part, ctx);
       else if (part.kind === "poll") ok = await sendPollPart(runner, space, part, ctx);
       else ok = await sendImagePart(runner, space, part, ctx);
       // 语音退化成文字时也算发出去了一条（sendVoicePart 里已经发过）
@@ -6287,6 +7900,9 @@ const KIND_NAMES = {
   music: "音乐卡片",
   location: "位置",
   transfer: "转账卡片",
+  luckin: "瑞幸订单",
+  mcd: "麦当劳订单",
+  cancel_order: "取消订单",
   react: "emoji 回应",
   undo: "撤回",
   vote: "投票",
@@ -6590,6 +8206,95 @@ function stopLocWatcher(runner) {
   }
   // 关了再开是想马上看到效果：留着上一份的话人没动就永远等不来第一条
   runner.locLast?.clear();
+}
+
+/**
+ * 核对一遍：这个角色一直在聊的那个人，在不在项目的登记名单里。
+ *
+ * ── 为什么线路归属查完了还得再查这一道 ──
+ *
+ * 共享线路的白名单是**按地址**管的，而且进出两个方向同一道闸：项目里登记过
+ * 的地址才能和这条线路通话。线路归属（checkLineOwnership）证明的只是「这条
+ * 号码归你」，证明不了「正在跟你说话的那个人被允许」—— 实机上就撞到过线路
+ * 归属完全正常、对方发过来却一条都收不到。
+ *
+ * 出站那边早有证据，只是没人往这上面想：位置推送问对方在哪时，Photon 回的是
+ * `Target not allowed for this project`（见 friendloc.js:getEach）。同一道闸
+ * 在入站方向的表现是**彻底的沉默** —— 消息在 Photon 那头就被丢了，压根不进
+ * `instance.messages`，所以我们这边连一条日志都不会有，桥接还一直显示
+ * 「已连接，等消息中」，重启一百次也一样。这个函数就是把那份沉默翻出来。
+ *
+ * 查的是**存档里记着的对方地址**：刚启动时还没人说过话，`runner.lastSpace`
+ * 是空的，而存档里那个正是「上次好好聊着的那个人」—— 恰恰是要核对的对象。
+ *
+ * 比对号码时忽略格式差异（空格、横线、括号），只看数字；邮箱按小写比。
+ * 不然「登记的是 +86 138 0013 8000、存档里是 +8613800138000」会被误报成
+ * 没登记 —— 误报比不报更糟，机主会去改一个本来就对的号。
+ *
+ * @param {object[] | null} users checkLineOwnership 给回来的登记用户表，null = 没查成
+ */
+function checkPeersRegistered(getConfig, runner, users) {
+  if (!Array.isArray(users) || runner.stopped) return;
+
+  const role = currentRole(getConfig(), runner);
+  if (!role) return;
+
+  const scope = scopeOf(runner, "投递");
+  const allowed = new Set(users.map((u) => peerKeyOf(u?.phoneNumber)).filter(Boolean));
+  /*
+   * 两边都过一道 peerKeyOf 再比。
+   *
+   * `locPeersOf` 给回来的本来就是 peerKey，这里再归一一次是**有意的冗余**：
+   * peerKeyOf 幂等，重复调不花钱，但它把「这个函数要求调用方先归一」这条
+   * 隐式约定变成了本地保证。漏归一的后果是「+86 138 0013 8000」和
+   * 「+8613800138000」被判成两个人，然后冤枉一个本来就对的号 —— 这种误报
+   * 比不报更糟，机主会照着去改一个没坏的地方。
+   *
+   * 线路号码本身不进这个比较：它在名单里是以 assignedPhoneNumber 的身份，
+   * 不是「对方」。
+   */
+  const peers = [...locPeersOf(runner, role)]
+    .map((p) => peerKeyOf(p))
+    .filter((p) => p && !allowed.has(p));
+  if (!peers.length) return;
+
+  /*
+   * 名单是空的时候不喊「对方没登记」—— 那种情况下真正的问题是「这个项目一个
+   * 用户都没有」，checkLineOwnership 已经在那条路上说过了，这里再喊一遍只会
+   * 把人往错的方向带。
+   */
+  if (!allowed.size) return;
+
+  logError(
+    scope,
+    `聊天对象 ${peers.join("、")} 不在这个项目的登记名单里 —— 他发过来的消息我们收不到`,
+    `共享线路的白名单进出两个方向都管：只有在项目里登记过的地址才能和这条线路通话。\n` +
+      `这个项目现在登记着：${[...allowed].join("、")}\n` +
+      `所以对方发过来的消息 Photon 在它那头就丢了，我们这边一条日志都不会有，` +
+      `桥接却还显示「已连接」—— 重启没有用，坏的不是连接。\n` +
+      /*
+       * 先说「发错号」再说邮箱 —— 顺序是实机教的。
+       *
+       * 一上来把这归因成 Apple ID 邮箱，结果人家根本没用邮箱，用的是手机号，
+       * 只不过**手里有两个号**（双卡、或者换过号），iMessage 挑了没登记的那个
+       * 发出去。这种人自己看「发送与接收」只会看到一串正常的 +86，怎么看都对，
+       * 因为错的不是格式，是挑错了哪一个。所以这条排在最前面，而且话要说成
+       * 「是不是有第二个号」，不是「检查号码对不对」。
+       *
+       * 上面已经把两边的地址并排打出来了（聊天对象 vs 登记名单），对着看就知道
+       * 是哪一种，不用猜。
+       */
+      `两种修法，挑一种：\n` +
+      `  ① 让对方改用**上面那个已登记的号**发。注意看清楚是不是「有两个号、发错了那个」——\n` +
+      `     双卡手机、或者换过号的人最容易撞上：iMessage 挑了另一张卡/另一个号发出去，\n` +
+      `     他自己在「设置 → 信息 → 发送与接收」里看到的是一串正常的 +86，怎么看都对。\n` +
+      `     那里的「开始新对话时发送自」要选成上面登记的那个号；双卡还要确认 iMessage\n` +
+      `     用的是哪条线路。改完**新开一个对话**再发（旧对话可能还钉在旧地址上）。\n` +
+      `     （少数情况是发信地址变成了 Apple ID 邮箱，那在上面那行会显示成 xxx@xxx）\n` +
+      `  ② 或者把对方现在这个地址也在项目里登记一次（「iMessage → 项目」填他的号码点「开通线路」）。\n` +
+      `     共享线路给每个登记用户分的线路号**可能不一样**，登记完回来看这条预检打出的号，\n` +
+      `     以它为准发。`
+  );
 }
 
 /**
@@ -7020,8 +8725,46 @@ async function startRunner(getConfig, project, meta, retries = 0) {
       linePhone: project.linePhone ?? "",
     });
 
+    /*
+     * 再核对一次：配置里这个线路号码现在还归不归这个项目。
+     *
+     * 上面那道在**共享线路上等于没有** —— 它走 gRPC 的 isIMessageAvailable，
+     * 而共享线路对这个调用永远回「Target is a Photon-managed shared line」，
+     * 只落一条 debug 就跳过（真机日志里那句就是）。这一道走管理 REST API，
+     * 不受那条限制，查的也是另一件事：号码归属，而不是 iMessage 激活状态。
+     *
+     * 它堵的是实机撞到过的那一类：线路被 Photon 换掉 / 登记失效 / 手动填线路
+     * 时打错一位 —— 三种都表现为「对方发过去一点反应都没有、控制台一行日志
+     * 都不会有、重启没用」，因为消息压根没进程序。详见 photon.js 那边的注释。
+     *
+     * 同样不 await、同样自己兜住异常：预检失败不该影响这条连接。
+     */
+    if (runner.mode === "cloud") {
+      void checkLineOwnership({
+        projectId: runner.projectId,
+        projectSecret: runner.projectSecret,
+        label: scopeOf(runner, "投递"),
+        myPhone: project.myPhone ?? "",
+        linePhone: project.linePhone ?? "",
+      })
+        .then((users) => {
+          checkPeersRegistered(getConfig, runner, users);
+        })
+        .catch((e) => logDebug(scope, "核对线路归属出错", e));
+    }
+
     // 重启前排着的主动消息接着数 —— 这一步就是「关机不清计时器」
     rehydrateProactive(getConfig, runner);
+
+    // 定时提醒的心跳。关机期间到点的也是它补（过点 30 分钟内补发，再早的标「已错过」）
+    armReminders(getConfig, runner);
+
+    /*
+     * 共感娃娃的轮询。**整个进程一份**（玩偶里只有一部手机），所以这里重复
+     * 调用是安全的，已经在跑就什么都不做。和提醒相反**不补**关机期间的 ——
+     * 拥抱是个当场的动作，开机之后把昨晚的几次补发出来只会让人莫名其妙。
+     */
+    armHug(getConfig);
 
     /*
      * 还没人收、也还没提醒过的转账同理接着数。
@@ -7091,6 +8834,12 @@ async function startRunner(getConfig, project, meta, retries = 0) {
              * 那一轮就只发 IG、不发短信（见 igSessionFor）。
              */
             runner.lastSpace = { space, spaceId, peer, at: Date.now() };
+            // 用户自己的日程到点往哪个会话发：记这个角色最近在哪儿说话（没变不写盘）
+            noteLastChat(currentRole(getConfig(), runner)?.id, {
+              projectRefId: runner.projectRefId,
+              spaceId,
+              peer,
+            });
 
             /*
              * 已读回执：对方读了我们发出去的某条消息。
@@ -7156,6 +8905,14 @@ async function startRunner(getConfig, project, meta, retries = 0) {
                * 角色开了「收款后立刻通知」（transfer.notifyOnClaim，默认关）
                * 就当场起一轮，见下面那个分叉。
                */
+              /*
+               * 订单卡片（瑞幸 / 麦当劳）：贴 emoji 就是确认下单。和收款一样拦在 reactSend 那道闸
+               * 之前，结果攒成系统提示等下条消息一起送（见 claimOrderOnReact）。
+               */
+              if (await claimOrderOnReact(getConfig, runner, who, space, spaceId, peer, message)) {
+                continue;
+              }
+
               const claimed = await claimTransferOnReact(
                 runner,
                 who,
@@ -7239,6 +8996,8 @@ async function startRunner(getConfig, project, meta, retries = 0) {
             const plainText = renderMapsLinks(
               parts.map(extractText).filter(Boolean).join("\n")
             );
+            // 带了位置就记下来，瑞幸点单按这儿找最近的店（见 notePeerLocation）
+            notePeerLocation(runner, peer, plainText);
 
             /*
              * 卡片（网易云音乐那种从 app 的 iMessage 扩展里发出来的气泡）。
@@ -7820,7 +9579,9 @@ async function startRunner(getConfig, project, meta, retries = 0) {
              * 同样只在真的收到东西时才兑现：光贴不说话的话这里走不到，
              * 提示躺在 reactPending 里等下一条消息（超过 TTL 作废）。
              */
-            const reactHints = gotSomething ? takeReactHints(runner, peerKeyOf(peer)) : [];
+            const reactHints = gotSomething
+              ? [...takeReminderHints(runner, peerKeyOf(peer)), ...takeReactHints(runner, peerKeyOf(peer))]
+              : [];
             for (const hint of reactHints) {
               enqueue(getConfig, runner, space, spaceId, { text: hint, message }, peer);
             }
@@ -8077,6 +9838,12 @@ function scheduleRetry(getConfig, runner, err) {
 /** 停掉一条连接，清干净它的定时器。 */
 async function stopRunner(runner) {
   runner.stopped = true;
+  if (runner.reminderTimer) clearInterval(runner.reminderTimer);
+  runner.reminderTimer = null;
+  /*
+   * 娃娃那条轮询**不在这儿停** —— 它是整个进程一份的，别的连接可能还在听。
+   * 最后一条连接走掉时，那个循环自己看 runners.size 就退了（见 armHug）。
+   */
   // 清掉未触发的合并定时器，避免桥接停掉后还去发消息
   for (const slot of runner.pending.values()) {
     if (slot.timer) clearTimeout(slot.timer);
@@ -8138,6 +9905,8 @@ async function stopRunner(runner) {
    */
   for (const timer of runner.transferRemind?.values() ?? []) clearTimeout(timer);
   runner.transferRemind?.clear();
+  for (const timer of runner.luckinPoll?.values() ?? []) clearTimeout(timer);
+  runner.luckinPoll?.clear();
 
   if (runner.instance) {
     try {
@@ -8163,6 +9932,53 @@ async function stopRunner(runner) {
  *
  * @returns {Promise<{started:string[], stopped:string[], restarted:string[], kept:string[]}>}
  */
+/**
+ * 两个角色共用同一个 Photon 项目 —— 上线前先喊一声。
+ *
+ * 这种接法在界面上填得出来，填的时候一点不像错的，坏起来却是**时好时坏**：
+ * 同一个对话里第一条发得出去，一分钟后就 `Target not allowed for this
+ * project`；已读回执、打字指示器、位置推送跟着一起被拒。实机日志里就是这个
+ * 样子，查了很久才看出是两个角色的凭据有问题。
+ *
+ * 原因：每个角色会各开一条 Spectrum 连接订阅**同一个项目**的事件流，于是同一条
+ * 入站消息两个角色都收得到、都要回；而共享线路是按「登记用户」分配线路的，
+ * 到底从哪条线路发出去就成了掷骰子。要两个角色就要两个项目。
+ *
+ * 只看本地配置，不出网 —— 这件事光看配置就能断定，不需要问 Photon。
+ * 本地 Mac 模式没有项目凭据这回事，`projectReady` 已经把它们挡在外面了。
+ *
+ * 每次 syncBridges 都会跑，所以只在**真有冲突**时打日志；没冲突一个字都不说。
+ *
+ * 曾经还有一条「同一个手机号登记在两个项目里」，用户说那不算报错，1.16.2 删了。
+ */
+function warnProjectConflicts(projects) {
+  const group = (pick) => {
+    const m = new Map();
+    for (const p of projects ?? []) {
+      if ((p?.mode ?? "cloud") === "local") continue;
+      const k = String(pick(p) ?? "").trim();
+      if (!k) continue;
+      if (!m.has(k)) m.set(k, []);
+      m.get(k).push(p.id);
+    }
+    return [...m.entries()].filter(([, ids]) => ids.length > 1);
+  };
+
+  for (const [pid, ids] of group((p) => p.projectId)) {
+    logError(
+      "配置",
+      `有 ${ids.length} 个角色共用同一个 Photon 项目（${String(pid).slice(0, 8)}…）—— 它们会互相抢消息`,
+      `每个角色都会单独连一次、订阅的却是同一个项目的事件流，所以同一条消息两边都收到、都要回；\n` +
+        `而共享线路是按登记用户分配线路的，到底从哪条线路发出去是不确定的。\n` +
+        `症状是时好时坏：同一个对话里有的消息发得出去，有的回 Target not allowed for this project，\n` +
+        `已读回执、打字指示器、位置推送也会跟着一起被拒。\n` +
+        `修法：一个角色一个 Photon 项目。去 Photon 后台另开一个项目，把其中一个角色换成新的 ` +
+        `Project ID / Secret，再用一个**没被占用的**手机号登记一次。`
+    );
+  }
+
+}
+
 export async function syncBridges(getConfig) {
   const config = getConfig();
   const projects = config.projects ?? [];
@@ -8196,6 +10012,8 @@ export async function syncBridges(getConfig) {
   for (const { from, to } of followLineChange(lines, (msg) => logWarn("配置", msg))) {
     logInfo("配置", `线路号换了，会话存档 ${from} 已跟着改名为 ${to}`);
   }
+
+  warnProjectConflicts([...want.values()].map((w) => w.project));
 
   const result = { started: [], stopped: [], restarted: [], kept: [] };
 
@@ -8289,4 +10107,419 @@ export async function stopBridge(projectRefId) {
 /** 全部停掉。 */
 export async function stopAllBridges() {
   await Promise.all([...runners.values()].map((r) => stopRunner(r)));
+  // 娃娃那条轮询是整个进程一份的，一条连接都不剩了才轮到它停
+  stopDollWatcher();
+}
+/* ================= FaceTime 通话 ================= */
+
+/**
+ * 接一通 FaceTime。
+ *
+ * 这里是**通话和线上聊天的交汇点**：上下文、存档、记忆三样全部沿用发短信那一套
+ * （用户钉死的 —— 一接通就知道之前聊了什么，挂断后在 iMessage 里能接着聊）。
+ * 通话独有的那部分（拼通话提示词、流式合成）在 callturn.js。
+ *
+ * 为什么这几个函数住在这个文件：它们要用 `runners`、`loadHistory`、`afterTurn`、
+ * `sendSystem` 这些内部的东西。搬去 callturn.js 的话两个模块要互相 import ——
+ * 和 proactive.js / friendloc.js 当初的取舍一样（那两个文件头都写了这件事）。
+ */
+
+/**
+ * 按会话 id 找回 runner 和 space。通话要往 iMessage 里发东西时用
+ * （接之前那句「等我一下」、挂断后那条通话记录）。
+ *
+ * space 走现成的 `spaceForChat` —— 它自己会按「合并窗口里的 → 上一次用过的
+ * → 现问一次」三步找，比在这儿另写一套稳。
+ */
+async function callContext(getConfig, roleId, spaceId) {
+  const config = getConfig();
+  for (const runner of runners.values()) {
+    const role = currentRole(config, runner);
+    if (role?.id !== roleId) continue;
+    const space = await spaceForChat(runner, spaceId).catch(() => null);
+    if (space) return { runner, space, role };
+  }
+  return null;
+}
+
+/**
+ * 对方发来了一条 FaceTime 链接 —— 先问角色接不接。
+ *
+ * **不直接入会**。角色正在忙、在生气、在开车，完全可以不接，这一句比什么都有
+ * 「活人感」。模型回 `[接受通话]` 才起通话，回 `[拒绝通话]` 或者什么都不写就
+ * 当普通消息处理（正文照常发出去）。
+ *
+ * @returns {boolean} true = 这条消息已经被当成通话邀请处理了，别再走普通链路
+ */
+export function isCallInvite(config, role, text) {
+  if (!role?.call?.enabled) return false;
+  if (!config?.callNode?.enabled) return false;
+  return isFaceTimeInvite(text);
+}
+
+/**
+ * 角色答应接了 —— 起一通电话。
+ *
+ * @param {Function} getConfig
+ * @param {object} args
+ * @param {object} args.runner
+ * @param {object} args.role
+ * @param {string} args.spaceId
+ * @param {string} args.peer
+ * @param {string} args.link
+ * @returns {Promise<boolean>} 起没起起来
+ */
+export async function beginCall(getConfig, { runner, role, spaceId, peer, link, greeting = "" }) {
+  const scope = scopeOf(runner, "通话");
+
+  if (!nodeOnline()) {
+    /*
+     * 节点不在线。
+     *
+     * 用角色的口吻回一句，别让对方对着一通永远接不通的电话干等
+     * （这是用户点名要的：「不出戏」）。真正的原因写在日志里。
+     */
+    logWarn(scope, "通话节点不在线，接不了");
+    const space = await spaceForChat(runner, spaceId).catch(() => null);
+    if (space) {
+      await sendSystem(runner, space, "（这边信号好像不太好，打不通……）", {
+        what: "通话节点不在线",
+      }).catch(() => {});
+    }
+    return false;
+  }
+
+  const sessionId = sessionIdOf(runner, role, peer);
+  try {
+    startCall({
+      roleId: role.id,
+      roleName: role.name,
+      sessionId,
+      peer,
+      spaceId,
+      link,
+      // 角色在答应接的同一轮里写好的开场白。空 = 接通后现场打一轮模型
+      greeting,
+    });
+  } catch (e) {
+    logWarn(scope, "起通话失败", e);
+    return false;
+  }
+
+  /*
+   * 开场白**现在就开始合成**，不等接通。
+   *
+   * 下面那句 sendToNode 之后，节点要开浏览器、入会、再等对方在 iPhone 上点
+   * 「允许」—— 实测这段十几秒里什么都没在做。把合成塞进去，接通那一刻
+   * 只剩「把字节发给节点」，对方按下接听几乎没有空档。
+   *
+   * **不 await** —— await 的话这十几秒就变成「先合成几秒、再开始响铃」，
+   * 白等。primeGreeting 里把失败吃掉了，合成挂了只是退回现场打一轮。
+   */
+  if (greeting) {
+    const config = getConfig();
+    primeGreeting(synthesizeSay({ config, role, text: greeting }));
+    logDebug(scope, "开场白已经在合成了，等接通就能直接播", greeting);
+  }
+
+  const sent = sendToNode("join", {
+    link,
+    name: role.name,
+    // 节点拿它去取角色头像（见 callapi.js 的 /facetime/avatar）
+    roleId: role.id,
+    bargeIn: role.call?.bargeIn !== false,
+    // 关了的话节点就不截画面了（省得截了送过来再在这边丢掉）
+    seeCamera: role.call?.seeCamera !== false,
+    silenceNoticeMs: (role.call?.silenceNotice ?? 45) * 1000,
+    // 接通后等多久再开口（语音通道要热一下，不然头几个字被吃掉）
+    openingDelayMs: role.call?.openingDelayMs ?? 1500,
+  });
+  if (!sent) {
+    endCall("节点没收到入会指令");
+    return false;
+  }
+
+  logInfo(scope, `让节点去接了：${role.name} ← ${peer}`);
+  return true;
+}
+
+/**
+ * 通话里的一轮：对方说了一句（或者打字发来一条、或者半天没说话）。
+ *
+ * 和发短信那条路共用上下文、存档、记忆 —— 区别只在于不拆气泡、不走已读不回
+ * 那一摞，以及回复是一句一句合成播出去的。
+ *
+ * @param {Function} getConfig
+ * @param {object} args
+ * @param {Buffer} [args.audio] 对方说的那段 WAV
+ * @param {string} args.kind "said" | "typed" | "silence"
+ * @param {number} [args.seconds] kind = silence 时，静了多少秒
+ * @param {string} [args.typed] kind = typed 时，打字的内容
+ * @param {(type: string, data: object) => void} args.send 往节点那条流式响应里写
+ */
+export async function handleCallTurn(getConfig, { audio, kind = "said", seconds = 0, typed = "", send }) {
+  const call = getCall();
+  if (!call) throw new Error("现在没有正在进行的通话");
+
+  const ctx = await callContext(getConfig, call.roleId, call.spaceId);
+  if (!ctx) throw new Error("找不到这通电话对应的会话");
+  const { runner, role } = ctx;
+  const config = getConfig();
+  const scope = scopeOf(runner, "通话");
+
+  // 1. 对方说了什么
+  let said = typed;
+  let tone = "";
+  if (kind === "said") {
+    if (!audio?.length) throw new Error("没收到音频");
+
+    /*
+     * 背景声音在后台听，不等 —— 结果下一轮才告诉角色（见 callturn.js:listenAmbience）。
+     * 放在转写**前面**起跑：下面「这段没人说话」那种会直接 return，而纯噪音
+     * 恰恰是最能听出背景的一段。listenAmbience 自己管节流（30 秒一次）。
+     */
+    if (role.call?.hearAmbience !== false) listenAmbience({ config, role, call, wav: audio });
+
+    const heard = await transcribe(config, role, audio, { tone: role.call?.hearTone !== false });
+    said = heard.text;
+    tone = heard.tone;
+
+    /*
+     * 转写出来是「无声」之类的 —— VAD 误触了（咳嗽、关门、键盘声）。
+     *
+     * **什么都不做**，别为它打一轮模型：那一轮角色只会对着噪音搭话，而且
+     * 白花一次钱。实测第一通电话里有好几轮是这样的（打喷嚏、敲键盘）。
+     */
+    if (/^(无声|听不清|\[?无[人声]?\]?|silence|no speech)[。.、，,]*$/i.test(said.trim())) {
+      logDebug(scope, `这段没人说话（转写：${said.trim()}），跳过这一轮`);
+      return;
+    }
+
+    if (!said) {
+      /*
+       * 没听清就**什么都不做**。
+       *
+       * 别让角色说「我没听清」—— 多半是环境噪音被当成了说话（VAD 会误判），
+       * 这时候搭一句话反而莫名其妙。真没听清的话对方自己会再说一遍。
+       */
+      logDebug(scope, "这段没转出文字，跳过这一轮");
+      return;
+    }
+  }
+
+  // 2. 拼成这一轮的用户消息（带上「已接通多久」那个前缀）
+  const userName = resolveUser(config, role)?.name ?? "{{user}}";
+  const userMsg = callUserMessage({
+    kind,
+    text: said,
+    seconds,
+    userName,
+    tone,
+    // 上一轮（或更早）在后台听出来的背景，有新的才有
+    ambience: takeAmbience(call),
+    /*
+     * 摄像头画面：对方开口时节点就截了一帧、识图已经在跑（见 handleCallFrame），
+     * 多半这会儿已经看完了；没看完最多再等两秒，还不好就留给下一轮。
+     */
+    camera: role.call?.seeCamera !== false ? await takeFrame(call) : null,
+  });
+
+  /*
+   * ── 开场白：角色早就写好了，直接念，不打模型 ──
+   *
+   * 它写在答应接电话那一轮的 `[接受通话]` 后面（见 calltags.js:inviteNotice）。
+   * 拿到的话这一轮就只剩合成，对方按下接听几乎立刻听到声音；拿不到
+   * （角色只写了个标记）就往下走，照旧现场打一轮。
+   *
+   * 存档、历史、记忆走的还是下面那同一段代码 —— 这段话确实是在电话里说的，
+   * 该和别的轮次一样记上。
+   */
+  if (kind === "greeting") {
+    const ready = takeGreeting();
+    if (ready.text) {
+      /*
+       * 音频多半已经在 beginCall 那会儿合成好了（见那边）。await 一下是为了
+       * 兜住「对方点得特别快，合成还没完」那种情况 —— 那时等的是剩下的那点
+       * 时间，不是从零开始。
+       *
+       * 合成失败（primeGreeting 吃掉异常后给 null）或者压根没提前合成：
+       * 现场合成一次，照样不打模型。
+       */
+      let parts = ready.audio ? await ready.audio : null;
+      if (parts?.length) {
+        logInfo(scope, "接通了，念角色先前写好的开场白（音频早就合成好了）", ready.text);
+      } else {
+        parts = await synthesizeSay({ config, role, text: ready.text });
+        logInfo(scope, "接通了，念角色先前写好的开场白（现场合成）", ready.text);
+      }
+      await speakAndRecord({ stream: replayParts(parts), ctx, config, role, call, userMsg, send, scope });
+      return;
+    }
+    logDebug(scope, "角色接的时候没写开场白，现场打一轮");
+  }
+
+  // 3. 上下文：和发短信**同一条历史**
+  const history = loadHistory(runner, role, call.sessionId, scope);
+  history.push({ role: "user", content: userMsg });
+  runner.history.set(call.sessionId, history);
+
+  // 4. 拼提示词。通话预设那份，没挑就用内置的默认通话预设
+  const built = await buildPrompt(config, role, resolveUser(config, role), history, "", {
+    mode: "call",
+    presetRef: role.call?.presetRef ?? "",
+  });
+  runner.history.set(call.sessionId, built.history);
+
+  // 5. 打模型，一句一句合成送回节点；存档、记忆、挂断都在 speakAndRecord 里
+  await speakAndRecord({
+    stream: runCallTurn({
+      config,
+      role,
+      messages: built.messages,
+      params: built.params,
+    }),
+    ctx,
+    config,
+    role,
+    call,
+    userMsg,
+    send,
+    scope,
+  });
+}
+
+/**
+ * 节点送来一帧摄像头画面（或者「摄像头关着」）。
+ *
+ * 不等识图：在后台描述好挂在这通电话上，handleCallTurn 拼用户消息时来拿。
+ * 角色栏关了「看摄像头」就直接丢掉 —— 连识图都不打。
+ *
+ * @param {Function} getConfig
+ * @param {{off?: boolean, jpeg?: string}} frame
+ */
+export function handleCallFrame(getConfig, frame) {
+  const call = getCall();
+  if (!call) return;
+  const config = getConfig();
+  const role = (config.roles ?? []).find((r) => r.id === call.roleId);
+  if (!role || role.call?.seeCamera === false) return;
+  void seeFrame({ config, role, call, frame });
+}
+
+/** 把攒好的那几句原样吐出去，让 speakAndRecord 那边不用分叉。 */
+async function* replayParts(parts) {
+  for (const p of parts ?? []) yield p;
+}
+
+/**
+ * 把一轮的产出播出去，然后存档、进记忆、该挂就挂。
+ *
+ * 两条路共用：模型现场生成的那一轮（`runCallTurn`），和念先前写好的开场白
+ * （synthesizeSay）。**刻意不分叉** —— 开场白也是电话里真说出口的话，该和
+ * 别的轮次一样进存档、进上下文、进待总结。
+ *
+ * @param {object} args
+ * @param {AsyncGenerator} args.stream 一句一句往外吐 `{text, audio, media, seq}`
+ */
+async function speakAndRecord({ stream, ctx, config, role, call, userMsg, send, scope }) {
+  const { runner } = ctx;
+  const pieces = [];
+  const media = [];
+  // 每句在剥标记之前判的挂断（见 callturn.js:sayOne）—— pieces 里已经没有那个标记了
+  let wantsHangUp = false;
+
+  for await (const part of stream) {
+    if (part.hangUp) wantsHangUp = true;
+    if (part.text) pieces.push(part.text);
+    if (part.media?.length) media.push(...part.media);
+    if (part.audio) {
+      send("say", { text: part.text, audio: part.audio.toString("base64"), seq: part.seq });
+    } else if (part.text) {
+      // 合成失败：把文字也报上去，节点那边会记进日志，至少知道它想说什么
+      send("silent", { text: part.text });
+    }
+  }
+
+  const reply = pieces.join("");
+
+  // 角色要挂断吗
+  const read = readHangUp(reply);
+  const hangUp = wantsHangUp || read.hangUp;
+  const clean = read.text;
+
+  // 存档 + 记忆 —— 和发短信走的是同一个函数
+  const space = ctx.space;
+  appendTurn(
+    call.sessionId,
+    { roleId: role.id, roleName: role.name, peer: call.peer },
+    [
+      { role: "user", content: userMsg },
+      { role: "assistant", content: clean },
+    ],
+    (msg) => logWarn(scope, msg)
+  );
+  const hist = runner.history.get(call.sessionId) ?? [];
+  hist.push({ role: "assistant", content: clean });
+  runner.history.set(call.sessionId, hist);
+  afterTurn(runner, space, config, role, { user: userMsg, assistant: clean });
+  noteTurn(userMsg, clean);
+
+  // 通话里照样能转账、发卡片 —— 标记早被挑出来了，这里执行它们
+  if (media.length) {
+    logDebug(scope, `这一轮还有 ${media.length} 个要发出去的东西`);
+  }
+
+  if (hangUp) {
+    /*
+     * `drain` = 先把话说完再挂。
+     *
+     * `[结束通话]` 前面几乎总还有一句「再见」，而挂断指令走的是控制通道、
+     * 和送音频那条响应是两条独立的通道 —— 不等的话节点会在那句话还在播的
+     * 时候关掉浏览器，对方听到半个字然后断线。见 call.mjs:#drainSpeech。
+     *
+     * 这一轮**一个字都没说**（整段只有那个标记）就不用等：那是「不吭声直接
+     * 挂」，drain 下去只是白等队列确认一遍。
+     */
+    const spoke = Boolean(clean);
+    logInfo(scope, spoke ? "角色自己挂了（说完这句就挂）" : "角色自己挂了（没说话，直接挂）");
+    sendToNode("hangup", { reason: "角色挂断", drain: spoke });
+  }
+}
+
+/**
+ * 通话结束，收尾。
+ *
+ * 在聊天记录里留一条「通话结束 · 3 分 12 秒 · 8 轮对话」—— 翻记录时看得到
+ * 什么时候通过话，模型下一轮也看得见刚才通过电话。
+ *
+ * ── 只进存档，**不发短信** ──
+ *
+ * 原来这里还 `sendSystem` 了一遍，于是对方真的在 iMessage 里收到一条
+ * 「通话结束 · 3 分 46 秒 · 8 轮对话」。那不对：真的 FaceTime 挂断之后，
+ * iMessage 里出现的是系统自己那条通话记录，不是对方给你发的一条短信。
+ * 角色刚跟你通完电话，紧接着发一条机器腔的统计过来，很破戏。
+ *
+ * 想让角色挂断后说点什么的话，那本来就该是它自己的下一条消息，不是这一条。
+ */
+export async function finishCall(getConfig, call) {
+  if (!call) return;
+
+  /*
+   * 通话记录（控制台那个「最近通话」列表）先记 —— 它不依赖会话上下文，
+   * 哪怕下面 callContext 没找着（角色被删了、会话对不上）也该留下这一条。
+   */
+  noteCall(call);
+
+  const ctx = await callContext(getConfig, call.roleId, call.spaceId);
+  if (!ctx) return;
+  const { runner } = ctx;
+  const line = callRecordLine(call);
+
+  appendTurn(
+    call.sessionId,
+    { roleId: call.roleId, roleName: call.roleName, peer: call.peer },
+    [{ role: "system", content: line }],
+    (msg) => logWarn(scopeOf(runner, "通话"), msg)
+  );
+  logInfo(scopeOf(runner, "通话"), `记进聊天记录：${line}`);
 }

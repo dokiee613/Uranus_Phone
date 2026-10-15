@@ -74,6 +74,14 @@ export class Uranus extends DurableObject {
     seedPresets();
     seedTransferLogos();
     setWebhookRegistry({ ensure: (id, secret) => this.ensureWebhook(id, secret) });
+    /*
+     * 「Uranus 去连节点」那条隧道（core/server/src/calltunnel.js）要把节点送来的
+     * 请求交给自己的路由。桌面版是 fetch 本机 127.0.0.1:8787，Worker 里没有真的
+     * 端口，所以给它一个直接递进 express 的口子。隧道只转 /facetime/*，
+     * 不经过上面 fetch 里那道控制台登录闸 —— 那几条本来就不在 /api/ 下面，
+     * 靠的是配对密钥。
+     */
+    globalThis.__uranusLocalDispatch = (req) => handleAsNodeRequest(PORT, req);
     this.auth = await import("../core/server/src/auth.js");
     await this.seedPassword();
     await import("../core/server/src/index.js");

@@ -85,6 +85,10 @@ export const SECRET_PATH = path.join(DATA_DIR, "data.config.json");
  *  - 最要紧的是**用户要能自己打开它**：密码忘了的唯一出路是把 password 那行
  *    清成空串（见 auth.js）。那件事必须简单到能在记事本里做完，不能让人在
  *    一份几百行的配置里翻。
+ *
+ * 进云备份时跟**密钥**走（cloudbackup.js:SECRET_RELS）：勾了「含密钥」才带。
+ * 勾了就能在新机器上用原来的账号密码直接进去；不勾的话一份能分享出去的包里
+ * 不会带着登录凭据。
  */
 export const AUTH_PATH = path.join(DATA_DIR, "auth.json");
 
@@ -98,6 +102,9 @@ export const AUTH_PATH = path.join(DATA_DIR, "auth.json");
  * 时间戳等于让「改设置」和「记进度」互相踩。
  *
  * 也不进 data.config.json：那是密钥文件，和这个语义毫无关系。
+ *
+ * 进云备份的「配置」那一块（cloudbackup.js:SCOPES）：带着它搬，「每 3 天备份
+ * 一次」在新机器上接着数而不是从零开始。
  */
 export const MAINTENANCE_PATH = path.join(DATA_DIR, "maintenance.json");
 /**
@@ -106,8 +113,23 @@ export const MAINTENANCE_PATH = path.join(DATA_DIR, "maintenance.json");
  * 落盘的理由只有一个：查不到的时候拿上一次查到的顶上。纯内存的话，
  * 网络不通的时候重启一次进程，连「上一次」都没有了。丢了也不要紧 ——
  * 删掉这个文件最多让下一轮多打一次网络。
+ *
+ * 也正因为「丢了不要紧」，它**不进云备份**（cloudbackup.js 文件头列着原因）。
  */
 export const WEATHER_CACHE_PATH = path.join(DATA_DIR, "weather-cache.json");
+/**
+ * 通话记录：谁、什么时候、打了多久、几轮、怎么结束的。见 calllog.js。
+ *
+ * **只存这几个数，不存说了什么** —— 说的话早就跟着 `appendTurn` 进了会话
+ * 存档（通话和短信共用同一条历史，这是用户钉死的）。在这儿再存一份就是
+ * 两份会各自漂移的同一件事。
+ *
+ * 等于手机上那个「最近通话」列表：翻得到什么时候通过话、聊了多久，
+ * 想看说了什么就去聊天记录里翻那一段。
+ *
+ * 进云备份的「聊天与记忆」那一块（cloudbackup.js:SCOPES）。
+ */
+export const CALL_LOG_PATH = path.join(DATA_DIR, "calls.json");
 export const CHARACTERS_DIR = path.join(DATA_DIR, "characters");
 export const WORLDS_DIR = path.join(DATA_DIR, "worlds");
 export const USER_DIR = path.join(DATA_DIR, "user");
@@ -184,6 +206,10 @@ export const XHS_MEDIA_DIR = path.join(XHS_DIR, "media");
  * 分两层的原因：索引里只有「开没开、有哪几条剧情」这种一行字的东西，
  * 每轮都要读；正文按剧情分文件，演一轮只重写当前这一条，归档的老剧情
  * 不跟着抖 —— 一条演久了的剧情能有几百轮，全塞一个文件里每轮都得整份重写。
+ *
+ * 进云备份的「聊天与记忆」那一块，`media/` 抠去「图片」那一块
+ * （cloudbackup.js:SCOPES / CARVED_OUT）。一条演久了的剧情是几百轮聊出来的，
+ * 重建不了 —— 这是这整块里最该备份的东西之一。
  */
 export const OFFLINE_DIR = path.join(DATA_DIR, "offline");
 export const OFFLINE_INDEX_DIR = path.join(OFFLINE_DIR, "index");
@@ -195,6 +221,9 @@ export const OFFLINE_STORIES_DIR = path.join(OFFLINE_DIR, "stories");
  * 和 IG 的 media/ 分开：那边是帖子和快拍的图，删帖会去扫「哪些文件还在用」
  * （igstore.js:pruneOrphanMedia）。混在一起的话，那把扫帚会把线下头像
  * 当成孤儿图删掉 —— 它不认识剧情文件里的引用。
+ *
+ * 进云备份的「图片」那一块（cloudbackup.js:SCOPES），和 instagram/media 同一个
+ * 待遇：从 offline/ 里抠出来，不跟着「聊天与记忆」上网。
  */
 export const OFFLINE_MEDIA_DIR = path.join(OFFLINE_DIR, "media");
 
@@ -206,8 +235,17 @@ export const OFFLINE_MEDIA_DIR = path.join(OFFLINE_DIR, "media");
  *
  * **不进 config.json**，和 IG、线下剧情同一条理由：`PUT /api/config` 会顺带
  * 重启所有 iMessage 桥接，而这边是每笔转账都写。
+ *
+ * 进云备份的「聊天与记忆」那一块（cloudbackup.js:SCOPES）：少了它，恢复之后
+ * 那些还挂着「待收款」的卡片再也改不成「已收款」。
  */
 export const TRANSFERS_DIR = path.join(DATA_DIR, "transfers");
+
+/**
+ * 瑞幸订单卡片：一个角色一份，卡片句柄 + 订单内容 + 状态（见 luckinstore.js）。
+ * 不进 config.json，理由同 TRANSFERS_DIR；进云备份的「聊天与记忆」，同上。
+ */
+export const LUCKIN_DIR = path.join(DATA_DIR, "luckin");
 
 /**
  * 转账卡片上那张缩略图的素材（品牌 logo 之类）。
@@ -218,6 +256,9 @@ export const TRANSFERS_DIR = path.join(DATA_DIR, "transfers");
  *
  * 用哪个 logo 是**角色配置**（role.transfer.logo），因为那决定这个角色的卡片
  * 长什么样；文件本身在这儿，两边靠文件名对上（见 transferlogo.js）。
+ *
+ * 也因为这条，它进云备份的「配置」那一块而不是「图片」（cloudbackup.js:SCOPES）：
+ * 少了这个文件，恢复出来的角色卡片指着一张不存在的图。
  */
 export const TRANSFER_LOGO_DIR = path.join(DATA_DIR, "transfer-logos");
 
@@ -228,7 +269,7 @@ export const TRANSFER_LOGO_DIR = path.join(DATA_DIR, "transfer-logos");
  * 没有它，模型写 `[vote:B]` 就没法翻成真正要投的那个选项 id。
  *
  * **不进 config.json**，和转账同一条理由：`PUT /api/config` 会重启所有桥接，
- * 而这边是每个投票事件都写。
+ * 而这边是每个投票事件都写。进云备份的「聊天与记忆」，同转账。
  */
 export const POLLS_DIR = path.join(DATA_DIR, "polls");
 
@@ -237,8 +278,19 @@ export const POLLS_DIR = path.join(DATA_DIR, "polls");
  *
  * **不进 config.json**，理由同上：生成一次就要写一次，`PUT /api/config` 会顺带
  * 对齐所有桥接。只有设置（用哪个模型、提示词、超时）进 config.theater。
+ *
+ * 进云备份的「聊天与记忆」那一块（cloudbackup.js:SCOPES）—— 成品是生成出来的
+ * 番外，和聊天记录一样重建不了。
  */
 export const THEATER_DIR = path.join(DATA_DIR, "theater");
+
+/**
+ * 定时提醒（reminder.js）：角色设的和用户自己的日程都在这一个文件里，外加默认提前量。
+ * **不进 config.json**，理由同上：每触发一次就要写一次。
+ *
+ * 进云备份的「聊天与记忆」那一块（cloudbackup.js:SCOPES）。
+ */
+export const REMINDERS_PATH = path.join(DATA_DIR, "reminders.json");
 export const THEATER_HTML_DIR = path.join(THEATER_DIR, "html");
 
 /**
@@ -408,6 +460,7 @@ export function ensureLayout() {
     OFFLINE_STORIES_DIR,
     OFFLINE_MEDIA_DIR,
     TRANSFERS_DIR,
+    LUCKIN_DIR,
     TRANSFER_LOGO_DIR,
     POLLS_DIR,
   ]) {
@@ -445,7 +498,97 @@ export function ensureLayout() {
 }
 
 /**
- * 把 assets/presets/ 里那两份种子拷进刚建出来的 data/presets/。
+ * 「通话默认预设」补发过了没有。见 topUpCallPreset。
+ *
+ * 放在 DATA_DIR 根上、不叫 .json —— 放进 presets/ 的话会被 writeCollection 的
+ * 清扫当成过期预设删掉。
+ *
+ * **不进云备份**（cloudbackup.js 文件头列着原因）：跟着包搬过去会让新机器
+ * 以为补过了，于是那份预设永远不来。这一个的正确行为是不带。
+ */
+const CALL_SEED_MARK = path.join(DATA_DIR, ".seeded-call-preset");
+
+/**
+ * 给**已经装过的人**补一份「通话默认预设」。只补一次。
+ *
+ * ── 为什么要补 ──
+ *
+ * 种子只在 data/presets/ 第一次被建出来时拷（seedPresets），而通话是后来才
+ * 加的 —— 所以在那之前装好的每一台机器，预设列表里都**永远没有**通话预设。
+ * 提示词其实一直有（makeDefaultPreset 那份内置兜底），但它不在列表里，
+ * 用户看不见、也改不了。用户的原话：「我还是没有看到默认的通话预设」。
+ *
+ * ── 规矩 ──
+ *
+ *  - **只补一次**，补完写一个标记。用户之后把它删了，是他的选择，不再补回来
+ *    （和 seedPresets「文件夹在了就当老用户」同一条规矩）。
+ *  - 列表里已经有任何一份通话预设（用户自己建过）就不补，只写标记。
+ *  - 新装的机器 seedPresets 已经拷了三份，走到这儿会看到通话预设已在，只写标记。
+ *  - 文件名用「现有最大序号 + 1」，排在列表最后，不打乱用户自己排好的顺序。
+ *
+ * **只能从 loadConfig 调**，不能放进 ensureLayout：writeToDisk 也调 ensureLayout，
+ * 紧接着 writeCollection 会把「这次没写过的 .json」清扫掉 —— 在那条路上补进来
+ * 的文件会被当场删掉，而标记已经写了，就再也补不回来。
+ *
+ * 失败只 warn：没有它照样能打电话（回落到内置兜底），只是列表里看不到。
+ */
+export function topUpCallPreset() {
+  if (fs.existsSync(CALL_SEED_MARK)) return;
+  const mark = () => {
+    try {
+      fs.writeFileSync(
+        CALL_SEED_MARK,
+        "这个文件表示「通话默认预设」已经补发过一次。删掉它，下次启动会再补一份（前提是预设里一份通话预设都没有）。\r\n",
+        "utf-8"
+      );
+    } catch (e) {
+      logWarn("配置", "通话预设的补发标记写不进去", e);
+    }
+  };
+
+  const modeOf = (file) => {
+    try {
+      return JSON.parse(fs.readFileSync(file, "utf-8"))?.mode;
+    } catch {
+      return undefined;
+    }
+  };
+
+  let existing;
+  try {
+    existing = fs.readdirSync(PRESETS_DIR).filter((n) => n.toLowerCase().endsWith(".json"));
+  } catch {
+    return; // 预设文件夹都还没有：等 ensureLayout 建好、seedPresets 拷完再说
+  }
+  if (existing.some((n) => modeOf(path.join(PRESETS_DIR, n)) === "call")) return mark();
+
+  let seed;
+  try {
+    seed = fs
+      .readdirSync(BUILTIN_PRESET_DIR)
+      .filter((n) => n.toLowerCase().endsWith(".json"))
+      .find((n) => modeOf(path.join(BUILTIN_PRESET_DIR, n)) === "call");
+  } catch {
+    return; // 精简安装没有 assets/presets/，当没这回事（也不写标记，装回来还能补）
+  }
+  if (!seed) return;
+
+  const next = existing.reduce((m, n) => Math.max(m, Number.isFinite(orderOf(n)) ? orderOf(n) : 0), 0) + 1;
+  const target = path.join(PRESETS_DIR, `${String(next).padStart(2, "0")}-${seed.replace(/^\d+-/, "")}`);
+  try {
+    fs.copyFileSync(path.join(BUILTIN_PRESET_DIR, seed), target, fs.constants.COPYFILE_EXCL);
+    logInfo("配置", "这一版起有了内置的「通话默认预设」，已经放进预设列表，可以直接改");
+  } catch (e) {
+    if (e?.code !== "EEXIST") {
+      logWarn("配置", "通话默认预设补不进去", e);
+      return; // 不写标记，下次启动再试
+    }
+  }
+  mark();
+}
+
+/**
+ * 把 assets/presets/ 里那几份种子（线上 / 线下 / 通话）拷进刚建出来的 data/presets/。
  *
  * **只在 data/presets/ 压根不存在时调**（见 ensureLayout 顶上那个 freshPresets）。
  * 「文件夹已经在了」一律当老用户处理，包括它是空的 —— 用户把预设全删光是他的

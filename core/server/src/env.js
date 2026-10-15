@@ -15,7 +15,7 @@
  *
  *   [{{user}}发送当地时间 CST : 2026-09-08 00:38:07 | 周二, 工作日 |
  *    {{char}}收到当地时间 PDT : 2026-09-07 09:38:07 | 周一, 工作日 |
- *    {{user}}当地天气: 南宁 晴 26.1°C (24.1~32.4°C) | 明日预报: 雷阵雨 25.8~32.0°C | ⚠ 暴雨橙色预警 ;
+ *    {{user}}当地天气: 上海 晴 26.1°C (24.1~32.4°C) | 明日预报: 雷阵雨 25.8~32.0°C | ⚠ 暴雨橙色预警 ;
  *    {{char}}当地天气: 旧金山 晴 18.1°C (14.2~21.0°C) | 明日预报: 阴 18.1~31.4°C]你好
  *
  * （实际是一行，这里为了看得清才折行。）存档里只有前两段。
@@ -42,6 +42,7 @@ import Holidays from "date-holidays";
 
 import { WEATHER_CACHE_PATH, readJson, writeJson } from "./datadir.js";
 import { logDebug, logWarn } from "./logs.js";
+import { specialDayNames } from "./reminder.js";
 import { whyNetwork } from "./net.js";
 
 /**
@@ -539,7 +540,7 @@ async function fetchJson(url, timeout, headers) {
 /**
  * 内置坐标表：常见城市不打网络也能解析。
  *
- * 加这张表的直接原因是「解析城市「南宁」失败 TimeoutError」——
+ * 加这张表的直接原因是「解析城市「上海」失败 TimeoutError」——
  * geocoding-api.open-meteo.com 在国内并不总是通的，而它一超时会连累三件事：
  * 没有天气、时区退回服务器本地（两地时间全错）、**国家码拿不到**。
  * 最后那条最要命：`pickSource` 是靠 `country === "CN"` 才走和风天气的，
@@ -559,7 +560,7 @@ const BUILTIN_CITIES = [
   ["重庆", 29.563, 106.5516, CN_TZ, "CN", "chongqing"],
   ["广州", 23.1291, 113.2644, CN_TZ, "CN", "guangzhou", "canton"],
   ["深圳", 22.5431, 114.0579, CN_TZ, "CN", "shenzhen"],
-  ["南宁", 22.817, 108.3665, CN_TZ, "CN", "nanning"],
+  ["上海", 22.817, 108.3665, CN_TZ, "CN", "nanning"],
   ["桂林", 25.2736, 110.29, CN_TZ, "CN", "guilin"],
   ["柳州", 24.3255, 109.4155, CN_TZ, "CN", "liuzhou"],
   ["成都", 30.5728, 104.0668, CN_TZ, "CN", "chengdu"],
@@ -1068,14 +1069,48 @@ async function resolveSides(env) {
   return { user, char };
 }
 
+/**
+ * {{user}} 那边的时区：定时提醒按它算（用户定的：异地有时差就按用户那边）。
+ * 两种模式都看「所在城市」（userCity）；没填或解析不出来就用系统时区。
+ * 不看 time.enabled —— 时间感知关着，提醒也得按对的时区响。
+ */
+export async function userTzOf(role) {
+  try {
+    const geo = await geocode(String(role?.env?.time?.userCity ?? "").trim());
+    if (validTz(geo?.tz)) return geo.tz;
+  } catch {
+    /* 落到系统时区 */
+  }
+  return Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
+
 /** 一边的时间段：`{{user}}发送当地时间 CST : … | 周二, 工作日` */
-function timeSegment(label, who, geo, at, workday) {
+function timeSegment(label, who, geo, at, workday, dayMark) {
   const tz = geo?.tz || Intl.DateTimeFormat().resolvedOptions().timeZone;
   const { date, time, year } = tzParts(tz, at);
   const dow = tzDayOfWeek(tz, at);
   const tag = workday ? dayTag(geo?.country ?? "", date, year, at, dow) : "";
   const head = `${who}${label} ${tzAbbr(tz, at)} : ${date} ${time}`;
-  return tag ? `${head} | ${tzWeekday(tz, at)}, ${tag}` : `${head} | ${tzWeekday(tz, at)}`;
+  const week = tzWeekday(tz, at) + specialMark(date, dayMark, tag);
+  return tag ? `${head} | ${week}, ${tag}` : `${head} | ${week}`;
+}
+
+/**
+ * 星期后面缀的那截：「 · 宝宝的生日」「 · 在一起第一年纪念日」（reminder.js:specialDayNames）。
+ *
+ * 只缀在 {{user}} 那一侧（异地时两边日期可能差一天，生日纪念日按 {{user}} 那边的日子过）。
+ * dayMark（{id, aheadDays, festivals}）不传就不缀 —— 线下那条前缀按服务器时间，跟这些日子没关系。
+ */
+function specialMark(date, dayMark, tag = "") {
+  if (dayMark === undefined) return "";
+  try {
+    // 法定假日那一截（「国庆节」）已经写在后面了，节日表里同名的不再报一遍
+    const names = specialDayNames(date, dayMark.id, [tag], dayMark);
+    return names.length ? ` · ${names.join("、")}` : "";
+  } catch (e) {
+    logWarn("环境", "读纪念日失败，这一轮不带", e);
+    return "";
+  }
 }
 
 /**
@@ -1088,13 +1123,14 @@ function timeSegment(label, who, geo, at, workday) {
  * 城市取「所在城市」那一个（异地模式下的 userCity），charCity 在这个模式
  * 下不参与计算。
  */
-function timeSegmentSame(geo, at, workday) {
+function timeSegmentSame(geo, at, workday, dayMark) {
   const tz = geo?.tz || Intl.DateTimeFormat().resolvedOptions().timeZone;
   const { date, time, year } = tzParts(tz, at);
   const dow = tzDayOfWeek(tz, at);
   const tag = workday ? dayTag(geo?.country ?? "", date, year, at, dow) : "";
   const head = `时间 : ${date} ${time}`;
-  return tag ? `${head} | ${tzWeekday(tz, at)}, ${tag}` : `${head} | ${tzWeekday(tz, at)}`;
+  const week = tzWeekday(tz, at) + specialMark(date, dayMark, tag);
+  return tag ? `${head} | ${week}, ${tag}` : `${head} | ${week}`;
 }
 
 /**
@@ -1125,7 +1161,7 @@ function deg(v) {
 /**
  * 一边的天气段。
  *
- * 全开时：`{{user}}当地天气: 南宁 晴 25.9°C (24.1~32.4°C) | 明日预报: 雷阵雨 25.8~32.0°C | ⚠ 暴雨橙色预警`
+ * 全开时：`{{user}}当地天气: 上海 晴 25.9°C (24.1~32.4°C) | 明日预报: 雷阵雨 25.8~32.0°C | ⚠ 暴雨橙色预警`
  *
  * 三个开关各砍掉一段。`range` 关掉时明日只留最高温 —— 那正好是加这些
  * 开关之前的行为，所以老用户升级后看到的形状不变。
@@ -1183,11 +1219,13 @@ export async function buildEnv(role, keys, now = new Date()) {
     const workday = env.time.workday !== false;
 
     // 同城模式只认一个地方（userCity 那个输入框），两边共用它
+    // 星期后缀要的：哪个角色（生日纪念日按角色分）、提前几天、报不报节日
+    const dayMark = { id: role?.id ?? "", aheadDays: env.time.aheadDays ?? 1, festivals: env.time.festivals !== false };
     const time = same
-      ? `[${timeSegmentSame(sides.user, now, workday)}]`
+      ? `[${timeSegmentSame(sides.user, now, workday, dayMark)}]`
       : "[" +
         [
-          timeSegment("发送当地时间", "{{user}}", sides.user, now, workday),
+          timeSegment("发送当地时间", "{{user}}", sides.user, now, workday, dayMark),
           timeSegment("收到当地时间", "{{char}}", sides.char, now, workday),
         ].join(" | ") +
         "]";
@@ -1296,7 +1334,7 @@ export async function lastWeather(role) {
  *
  * 三样都要：界面上「发给模型的」和「进存档的」是两行显示的，这一版最需要
  * 让用户看清的就是这个区别。城市解析结果单独回传，好把查不到的城市标红，
- * 也能显示「识别到：南宁 / Asia/Shanghai / CN」。
+ * 也能显示「识别到：上海 / Asia/Shanghai / CN」。
  *
  * 密钥**只报有没有填**（`keys`），绝不回传内容。
  */

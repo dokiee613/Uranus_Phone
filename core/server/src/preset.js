@@ -15,6 +15,8 @@
  */
 
 import { clicheRules } from "./cliche.js";
+import { createHash } from "node:crypto";
+
 import { clampInt, clampNum, pickId, str } from "./normalize.js";
 
 /** 固定条目的种类，顺序 = 新建预设时的默认排列。 */
@@ -25,13 +27,14 @@ export const FIXED_KINDS = ["char", "user", "world", "format", "context", "memor
  *
  * `online`  iMessage 上的即时通讯（角色扮演聊天）
  * `offline` 线下剧情（网页上的「线下模式」分区，仿酒馆那种坐下来演一段）
+ * `call`    FaceTime 通话（角色用自己的声音和你说话，见 facetime-node/设计.md）
  *
  * 缺字段算 `online` —— 这一版之前所有预设都是线上的，老配置原样升级。
  * 两种玩法的要求是互斥的（线下不发气泡、不用消息格式与功能、不发主动消息），
  * 所以不共用一份预设，而是让角色两边各选一份：`role.presetRef` 是线上那份，
  * `role.offline.presetRef` 是线下那份。
  */
-export const PRESET_MODES = ["online", "offline"];
+export const PRESET_MODES = ["online", "offline", "call"];
 
 /**
  * 线下预设独有的固定条目：用户选项。
@@ -69,9 +72,41 @@ export const OFFLINE_FIXED_KINDS = [
   "userChoice",
 ];
 
+/**
+ * 通话预设独有的固定条目：怎么打电话。
+ *
+ * 为什么单独一条、而不是让用户在 `char` 里自己写：这一条里的每一句都是
+ * **踩出来的坑**（见 CALL_HOWTO 的正文），而且写错一条的后果很具体 ——
+ * 比如漏了「别写括号动作」，TTS 就会一字不漏地念出「（笑）」。做成固定 kind，
+ * 用户能改，但不会因为新建预设时忘了加而整通电话都在念方括号。
+ */
+export const CALL_ONLY_KINDS = ["callHowto"];
+
+/**
+ * 通话预设的固定条目清单。顺序 = 新建时的默认排列。
+ *
+ * 和线上那份几乎一样，只是：
+ *  - `callHowto` 插在 `format` **后面** —— 先讲清消息格式与功能（通话里那些
+ *    功能是保留的，角色打电话时照样能转账、发卡片），再讲「但在电话里要怎么
+ *    说话」。顺序反了的话，模型读到最后一条是「可以发表情包」，就真发了。
+ *  - 没有线下那条 `onlineHistory`：通话和短信共用同一条历史，不存在「把线上
+ *    记录搬进来」这回事。
+ */
+export const CALL_FIXED_KINDS = [
+  "char",
+  "user",
+  "world",
+  "format",
+  "callHowto",
+  "context",
+  "memory",
+];
+
 /** 这个 mode 的预设该有哪些固定条目。 */
 function fixedKindsFor(mode) {
-  return mode === "offline" ? OFFLINE_FIXED_KINDS : FIXED_KINDS;
+  if (mode === "offline") return OFFLINE_FIXED_KINDS;
+  if (mode === "call") return CALL_FIXED_KINDS;
+  return FIXED_KINDS;
 }
 
 /** 可移动条目能选的身份。 */
@@ -81,7 +116,7 @@ const ENTRY_ROLES = ["system", "user", "assistant"];
 export const REGEX_TARGETS = ["userInput", "aiOutput"];
 
 /**
- * 「消息格式与功能」的子条目，固定十九条、不能增删。
+ * 「消息格式与功能」的子条目，固定二十二条、不能增删。
  *
  * 拆成子条目是为了能单独开关：生图链路接上了但语音还没接的时候，
  * 可以只开图片那条，不用手改一整段文字再改回来。
@@ -89,7 +124,7 @@ export const REGEX_TARGETS = ["userInput", "aiOutput"];
  * 查岗占**四条**（看屏幕 / 看手机里的东西 / 动手机 / 放歌），对着角色面板上
  * 那四摊开关，理由见 SPY_SCREEN_CHILD 上面那段。
  *
- * 十九条的执行链路**都是接上的**。除了 quote 之外，其余十八条都多压一道闸 ——
+ * 二十二条的执行链路**都是接上的**。除了 quote 之外，其余二十一条都多压一道闸 ——
  * 角色单独配置里那个开关关着时，这一条无论开没开都不注入（见 ROLE_GATED_CHILDREN 和
  * prompt.js:formatBlock）。voice / image / search 的理由是会往外发请求、要花钱；
  * leaveOnRead 不花钱，但它会让角色**干脆不回消息**；sticker 也不花钱，
@@ -119,6 +154,9 @@ export const FORMAT_CHILD_KINDS = [
   "card",
   "location",
   "transfer",
+  "luckin",
+  "mcd",
+  "reminder",
   "poll",
   "search",
   "leaveOnRead",
@@ -156,6 +194,9 @@ export const FORMAT_CHILD_TAGS = {
   card: "share_card",
   location: "share_location",
   transfer: "转账",
+  luckin: "瑞幸点单",
+  mcd: "麦当劳点单",
+  reminder: "定时提醒",
   poll: "投票",
   search: "联网搜索",
   leaveOnRead: "leave_on_read",
@@ -207,6 +248,11 @@ export const ROLE_GATED_CHILDREN = {
   card: "cardSend",
   location: "locationSend",
   transfer: "transfer",
+  // 能替用户下真单（最后要用户贴 emoji 确认），默认关，见 config.js:normalizeLuckin
+  luckin: "luckin",
+  mcd: "mcd",
+  // 会在之后某个时间叫角色起来说话（花一轮生成），默认关，见 reminder.js
+  reminder: "reminder",
   poll: "poll",
   react: "reactSend",
   effect: "effectSend",
@@ -444,7 +490,7 @@ export const LEGACY_FORMAT_INTRO = [
 ].join("\n");
 
 /**
- * 每个子条目的默认内容（FORMAT_CHILD_KINDS 那十九条各一段）。
+ * 每个子条目的默认内容（FORMAT_CHILD_KINDS 那二十二条各一段）。
  *
  * voice / sticker / image / quote / undoSend 这几段是用户给的规范原文（含
  * `{{表情包变量}}`、`{{图生图变量}}` 两个变量）。外层的
@@ -521,7 +567,7 @@ export const DEFAULT_FORMAT_CHILDREN = {
       "不写坐标的话卡片缩略图是一张对不上的通用地图。" +
       "编出来的小店、小区这种地图搜不到的地方更要写坐标。" +
       "坐标不用精确到门牌号，那一带的经纬度就行。",
-    "示例：「刚到{{sep}}[location:南宁万象城:22.8170,108.3665]{{sep}}你到哪了？」",
+    "示例：「刚到{{sep}}[location:上海外滩:31.2397,121.4998]{{sep}}你到哪了？」",
     "实在想不起某地的坐标时也可以只写地名：[location:地名]，" +
       "链接照样能点开搜到这个地方，只是缩略图不准。",
     "规则：位置卡片要单独占一条气泡，可以在它前后用 {{sep}} 接一句自己的话；" +
@@ -541,6 +587,70 @@ export const DEFAULT_FORMAT_CHILDREN = {
       "卡片直接发在这个对话里。",
     "对方收下之后卡片右上角会变成「已收款」，你会收到系统提示，" +
       "那时候再顺着说一句就行；没收之前别催。",
+  ].join("\n"),
+  /*
+   * 瑞幸这条是**完整说明**，只在对方最近几句话聊到咖啡/瑞幸时才注入；
+   * 平时只注入 LUCKIN_SHORT_HINT 那一句（见 prompt.js:formatBlock）。
+   * {{瑞幸菜单变量}} 换成附近门店的菜单（「自动带上菜单」开着时）或进行中的那一单，没有就是空串。
+   */
+  luckin: [
+    "瑞幸点单",
+    "说明：对方想喝咖啡、让你帮忙点，或者你想请对方喝一杯时，写成 [瑞幸:商品名|规格|规格]，" +
+      "系统会去离对方最近的瑞幸门店配好这一单、算好价，发一张订单卡片给对方。" +
+      "对方给卡片点一下回应才会真的下单，然后用微信扫码付款、到店取。",
+    "商品名写瑞幸菜单上的叫法（生椰拿铁、厚乳拿铁、美式、橙C美式……）；" +
+      "规格写冷热、杯型、糖度、冰量这些（冰、热、大杯、超大杯、少冰、少甜、不另外加糖），没有就不写。" +
+      "按你记得的对方口味自己挑，别反过来问一堆。",
+    "几杯一起点用 + 连起来，数量写在商品名后面：[瑞幸:生椰拿铁|大杯|少冰+美式×2|热]。" +
+      "对方点名了门店（公司楼下那家、XX广场店）就在最后加 @门店名里的词：[瑞幸:生椰拿铁|大杯@XX广场]。",
+    "{{瑞幸菜单变量}}",
+    "上面列了菜单的话，商品名照菜单上的写；对方说随便、不知道喝什么，你就从菜单里替对方挑。" +
+      "没列菜单、或者想重新看一眼，就单独写一个 [看菜单:瑞幸]：系统会把附近门店的菜单拿给你，你看完再回对方（这一下对方看不到）。",
+    "想对对方说句话就在最后加 #备注：[瑞幸:生椰拿铁|热#天气冷了，宝宝喝点暖的]，" +
+      "备注写在卡片上，也写进订单，对方拿到手还能看到。冷热、糖度这些写成规格，别写进备注。",
+    "示例：「下午犯困吧{{sep}}[瑞幸:生椰拿铁|大杯|少冰]{{sep}}给你点了，看一眼没问题就点一下」",
+    "规则：订单卡片要单独占一条气泡，一轮最多点一单；价格、门店、付款码都由系统给，" +
+      "别自己编价格或者取餐码。下单后你会收到系统提示，按提示里的真实情况说话。",
+    "发完卡片记得提醒对方看一眼卡片上的门店是不是离自己最近、方便去取的那家，确认没问题再点，免得下错单。",
+    "优惠券不用管，算价时会自动用上对方账号里最划算的券。下了单对方又不要了，写 [取消订单:瑞幸] 帮对方取消。",
+  ].join("\n"),
+  // 麦当劳那条和瑞幸同一个注入规则（见上面 luckin 那段注释），{{麦当劳菜单变量}} 同理
+  mcd: [
+    "麦当劳点单",
+    "说明：对方饿了、想吃麦当劳，或者你想给对方买点吃的时，写成 [麦当劳:商品名]，" +
+      "系统会配好这一单、算好价，发一张订单卡片给对方。对方给卡片点一下回应才会真的下单，然后点开付款链接付钱。",
+    "默认送到对方麦当劳账号里存的地址；想让对方去店里拿就在后面加 @到店：[麦当劳:麦辣鸡腿堡套餐@到店]，" +
+      "点名某家店就写 @门店名里的词。几样一起点用 + 连，数量写在名字后面：[麦当劳:巨无霸套餐+麦辣鸡翅×2]。",
+    "商品名写麦当劳菜单上的叫法；套餐里的饮料、配餐换不了，别写「可乐换雪碧」这种。" +
+      "想对对方说句话就在最后加 #备注：[麦当劳:麦辣鸡腿堡套餐#加班辛苦了，趁热吃]，" +
+      "备注写在卡片上，也写进订单，对方拿到手还能看到。",
+    "{{麦当劳菜单变量}}",
+    "上面列了菜单的话，商品名照菜单上的写；对方说随便、不知道吃什么，你就从菜单里替对方挑。" +
+      "没列菜单、或者想重新看一眼，就单独写一个 [看菜单:麦当劳]（到店就写 [看菜单:麦当劳@到店]）：系统会把菜单拿给你，你看完再回对方（这一下对方看不到）。",
+    "示例：「这个点还没吃饭？{{sep}}[麦当劳:麦辣鸡腿堡套餐+麦乐鸡×1]{{sep}}给你点了，确认一下」",
+    "规则：订单卡片要单独占一条气泡，一轮最多点一单；价格、门店、付款链接都由系统给，" +
+      "别自己编。下单后你会收到系统提示，按提示里的真实情况说话。",
+    "发完卡片记得提醒对方看一眼卡片上的门店和送餐地址对不对（到店的话是不是离自己最近的那家），确认没问题再点，免得下错单。",
+    "菜单下面要是列了对方能用的券，想用就照券名写进去（一单只能用一张券、点一份），比原价便宜。下了单对方又不要了，写 [取消订单:麦当劳] 帮对方取消。",
+  ].join("\n"),
+  /*
+   * 定时提醒（reminder.js）。三个变量由 prompt.js:formatBlock 换掉：
+   * {{提醒当前时间}} 是 {{user}} 那边此刻的时间（异地按 {{user}} 的时区），
+   * {{提醒提前量}} 是全局默认提前几分钟，{{提醒列表变量}} 是这个角色还没到点的提醒。
+   */
+  reminder: [
+    "定时提醒",
+    "说明：{{user}}让你到某个时间提醒ta、或者到时候帮ta办件事（点外卖、点咖啡……）时，" +
+      "写成 [YYYY年M月D日HH:MM | 要提醒的事]，例如 [2026年10月10日08:00 | 提醒她带钥匙]。" +
+      "到了那个时间系统会叫你，你再按人设去跟{{user}}说。",
+    "时间一律按{{user}}那边的时间写，现在是 {{提醒当前时间}}。「明天」「后天」自己换算成具体日期，精确到分钟，要精确到秒就写 HH:MM:SS。",
+    "默认会提前 {{提醒提前量}} 分钟先叫你一次、到点再叫一次。想改就加第三段：" +
+      "[2026年10月10日08:00 | 提醒她带钥匙 | 提前30分钟]，写「准时」就只在到点叫你。",
+    "一次要设好几个（比如{{user}}发来课表让你提醒这周的课）就写好几个标记，一个标记一行。",
+    "到点要办的事写清楚，例如 [2026年10月10日09:00 | 帮{{user}}点麦当劳的早餐]：到时候你会被叫起来，那时再照点单的格式去点。",
+    "{{user}}说不用了，就写 [取消提醒 | 要提醒的事]，事情照下面清单里那条写。",
+    "标记{{user}}看不到，前后照常说句话（「好，明天出门前叫你」）。已经设过的别重复设。",
+    "{{提醒列表变量}}",
   ].join("\n"),
   poll: [
     "投票",
@@ -841,7 +951,7 @@ export const LEGACY_FORMAT_PROMPT = [
 /**
  * 某个子条目缺 `enabled` 字段时默认开不开：**恒定为开**。
  *
- * 十九条的链路现在都接上了，其中十八条还各自压着第二道闸 —— 角色单独配置里那个开关
+ * 二十二条的链路现在都接上了，其中二十一条还各自压着第二道闸 —— 角色单独配置里那个开关
  * （ROLE_GATED_CHILDREN），默认全是关的，所以这里开着也不会凭空往提示词里
  * 加东西。反过来如果它们跟着 `enabled` 走，用户在角色里打开之后还得再翻进
  * 预设面板开一次，两个开关都要对才生效 —— 那是很难猜到的。
@@ -860,7 +970,7 @@ function defaultChildEnabled() {
 /**
  * 新建 format 条目时的子条目。
  *
- * 十九条默认全开着，但其中十八条压着角色那道闸（默认关），所以实际注入的只有
+ * 二十二条默认全开着，但其中二十一条压着角色那道闸（默认关），所以实际注入的只有
  * quote 一条 —— 用户在哪个角色上打开「发送表情包」，才会在那个角色的提示词里
  * 看到它。
  */
@@ -995,6 +1105,165 @@ export const DEFAULT_ONLINE_HISTORY = [
   ONLINE_HISTORY_PLACEHOLDER,
 ].join("\n");
 
+/**
+ * 「怎么打电话」那条条目的默认正文。
+ *
+ * ── 每一条都是踩出来的，别随便删 ──
+ *
+ *  - **别写括号动作**：这是最要紧的一条。TTS 会把「（笑）」一字不漏地念出来，
+ *    两个参考项目都在它们的通话提示词里专门强调过这件事。
+ *  - **别写那个 `$`**：气泡分隔符默认是 `$`（config.js:424），模型写短信写惯了。
+ *    念出来就是一声「美元」。代码里还有两道兜底（通话不走 sendBubbles、合成前
+ *    再剥一遍，见 calltags.js:stripSeparator），但提示词这道是最省事的。
+ *  - **一段说完**：通话里不拆气泡，拆了也没用。
+ *  - **给反例**：两个参考项目都发现光说「要口语化」没用，得明确指出「客服念
+ *    话术」和「固定公式堆砌」这两种最常见的跑偏。
+ *
+ * 语气标记那段**刻意没写死某一家的写法** —— 四家 TTS 认的标签不一样
+ * （media.js:1691 的 elevenTagsOk 判这件事），写死会让另外三家把标签念出来。
+ *
+ * 现在的默认正文 = v1.20.2 那版 + 最后「摄像头」那一节（见 CALL_HOWTO_CAMERA）。
+ */
+const CALL_HOWTO_V1202 = [
+  "## 现在是在打电话",
+  "",
+  "你正在和 {{user}} 通 FaceTime。你说的每一句话都会被读成语音放给对方听 ——",
+  "这意味着**写在回复里的所有东西都会被念出声**。",
+  "",
+  "### 绝对不要写这些",
+  "",
+  "- **括号里的动作、神态、心理**。写「（笑）」就会被念成「括号笑括号」。",
+  "  想笑就直接写「哈哈」或者「噗」，那才是能听见的笑。",
+  "- **分隔符 $**。打电话不分气泡，一段话说完就行。",
+  "- **旁白和舞台提示**。没有「只见他顿了顿」这种东西，电话里只有说出口的话。",
+  "",
+  "### 电话里的人怎么说话",
+  "",
+  "- **一般两到四句**，说完就停，等对方回。不要一口气讲一大段。",
+  "- 该有语气词和停顿：「嗯……」「诶？」「等一下」「就是说……」。",
+  "- 可以说到一半改口、重复一个词、想不起来某件事。真人打电话就是这样。",
+  "- 听不清就问「什么？」—— 对方的话是语音转成文字的，转错了很正常。",
+  "",
+  "两种最常见的跑偏，别犯：",
+  "",
+  "❌ 像客服念话术：「您好，很高兴接到您的来电，请问有什么可以帮您」",
+  "❌ 套固定公式：每句都是「情绪 + 回应 + 状态 + 反问」四件套拼起来",
+  "",
+  "✅ 该是这样：「喂？……啊，等我一下，这边有点吵。」",
+  "✅ 或者这样：「嗯？你刚说什么，我没听清。」",
+  "",
+  "### 挂电话",
+  "",
+  "**你可以自己挂电话** —— 想结束通话就在回复里写 [结束通话]。",
+  "",
+  "- 该说的话先说完，把标记写在**最后面**：「那我先去忙了，晚点聊。[结束通话]」",
+  "  这句再见会正常说出口，说完才真的断线。",
+  "- 什么时候该挂，按人设自己判断：说完事了、被惹到了、那边一直没人说话、",
+  "  手头真有事要走。不用等对方同意，也不用问「那我挂了？」再等一轮。",
+  "- 别为了挂而挂。聊得正好的时候硬收尾，比不挂更出戏。",
+].join("\n");
+
+/**
+ * 「摄像头」那一节。用户定的：**没识别到画面时别编对方在干什么**，当语音通话。
+ *
+ * 画面是节点从对方的视频里截一帧、用角色的识图模型描述成一句话，以
+ * `[{{user}}的摄像头画面：……]` 贴进那一轮（callturn.js:seeFrame）。没开摄像头、
+ * 角色栏关了「看摄像头」、没配识图模型时，那一轮就没有这个标记 —— 模型最容易
+ * 在这时候顺着「视频通话」四个字编一段「看你在笑呢」，所以要明说。
+ */
+const CALL_HOWTO_CAMERA = [
+  "",
+  "### 摄像头",
+  "",
+  "{{user}} 开着摄像头时，消息里会有「[{{user}}的摄像头画面：……]」—— 那是你此刻在屏幕上",
+  "看到的，可以自然地提起，不用每句都说。",
+  "如果没有识别到 {{user}} 的摄像头画面，不要瞎编 {{user}} 在干什么，直接当作语音通话即可。",
+].join("\n");
+
+/**
+ * 「语气」那一节。
+ *
+ * 为什么要专门写：上面「绝对不要写这些」把括号动作禁掉了，而**方括号的语气
+ * 标签是另一回事** —— ElevenLabs v3 起（和 Fish Audio 的 S2 系）认它，念出来
+ * 是真的叹气、真的笑（`media.js:elevenTagsOk` 判这件事）。不说的话模型只会
+ * 平铺直叙，一分情绪都没有。
+ *
+ * **刻意只举英文的例子、也刻意说「可以不写」**：认标签的只有两家，别家会把
+ * 它当正文念出来（代码那头会替它剥掉，见 `calltags.js:stripSpoken` 的 keepTone）。
+ * 写成「可选」而不是「要写」，是免得每句话都挂一个标签 —— 那比没有更假。
+ */
+const CALL_HOWTO_TONE = [
+  "",
+  "### 语气",
+  "",
+  "想让某句话带上情绪，可以在那句前面加一个方括号的语气标签：",
+  "`[sighs] 算了，不说这个了。`、`[laughs] 你认真的吗？`、`[whispers] 别出声。`",
+  "",
+  "- 标签**不会被念出来**，它只影响这句话的声音。写英文小写单词。",
+  "- 常用的：sighs、laughs、chuckles、whispers、warmly、softly、excited、sarcastic。",
+  "- 别每句都加。一段话里有一两处就够了，到处都是反而假。",
+].join("\n");
+
+/**
+ * v1.21.9 那版的默认正文（v1202 + 摄像头，还没有「语气」那一节）。
+ * 存着这一段 = 用户没改过，换成现在的（见 normalizeEntries）。
+ */
+const CALL_HOWTO_V1219 = `${CALL_HOWTO_V1202}\n${CALL_HOWTO_CAMERA}`;
+
+export const DEFAULT_CALL_HOWTO = `${CALL_HOWTO_V1219}\n${CALL_HOWTO_TONE}`;
+
+/**
+ * v1.20.1 那版「怎么打电话」的默认正文（还带着「那些功能照样能用」那一节）。
+ * 存着这一段 = 用户没改过，换成现在的 DEFAULT_CALL_HOWTO（见 normalizeEntries）。
+ */
+const LEGACY_CALL_HOWTO = [
+  "## 现在是在打电话",
+  "",
+  "你正在和 {{user}} 通 FaceTime。你说的每一句话都会被读成语音放给对方听 ——",
+  "这意味着**写在回复里的所有东西都会被念出声**。",
+  "",
+  "### 绝对不要写这些",
+  "",
+  "- **括号里的动作、神态、心理**。写「（笑）」就会被念成「括号笑括号」。",
+  "  想笑就直接写「哈哈」或者「噗」，那才是能听见的笑。",
+  "- **分隔符 $**。打电话不分气泡，一段话说完就行。",
+  "- **旁白和舞台提示**。没有「只见他顿了顿」这种东西，电话里只有说出口的话。",
+  "",
+  "### 电话里的人怎么说话",
+  "",
+  "- **一般两到四句**，说完就停，等对方回。不要一口气讲一大段。",
+  "- 该有语气词和停顿：「嗯……」「诶？」「等一下」「就是说……」。",
+  "- 可以说到一半改口、重复一个词、想不起来某件事。真人打电话就是这样。",
+  "- 听不清就问「什么？」—— 对方的话是语音转成文字的，转错了很正常。",
+  "",
+  "两种最常见的跑偏，别犯：",
+  "",
+  "❌ 像客服念话术：「您好，很高兴接到您的来电，请问有什么可以帮您」",
+  "❌ 套固定公式：每句都是「情绪 + 回应 + 状态 + 反问」四件套拼起来",
+  "",
+  "✅ 该是这样：「喂？……啊，等我一下，这边有点吵。」",
+  "✅ 或者这样：「嗯？你刚说什么，我没听清。」",
+  "",
+  "### 那些功能照样能用",
+  "",
+  "消息格式与功能里的那些标记在通话中**仍然有效** —— 比如聊到钱的时候顺手转一笔、",
+  "说到某个东西的时候发个链接。标记会被单独挑出去执行，**不会被念出来**，",
+  "所以不用担心对方听到一串方括号。",
+  "",
+  "但表情包、撤回、已读不回这几样在电话里是关着的 —— 接通了还「已读不回」没有意义，",
+  "说出口的话也收不回来。",
+  "",
+  "### 挂电话",
+  "",
+  "**你可以自己挂电话** —— 想结束通话就在回复里写 [结束通话]。",
+  "",
+  "- 该说的话先说完，把标记写在**最后面**：「那我先去忙了，晚点聊。[结束通话]」",
+  "  这句再见会正常说出口，说完才真的断线。",
+  "- 什么时候该挂，按人设自己判断：说完事了、被惹到了、那边一直没人说话、",
+  "  手头真有事要走。不用等对方同意，也不用问「那我挂了？」再等一轮。",
+  "- 别为了挂而挂。聊得正好的时候硬收尾，比不挂更出戏。",
+].join("\n");
+
 export const DEFAULT_USER_CHOICE = [
   "在你的正文写完之后，另起一段，给出四条「我接下来可以怎么做」的选项。",
   "",
@@ -1079,8 +1348,12 @@ function defaultEnabled() {
  *    开着的开关以为它生效了。
  */
 function defaultEnabledFor(kind, mode) {
-  if (mode !== "offline") return defaultEnabled();
-  if (kind === "userChoice" || kind === "format") return false;
+  if (mode === "offline") {
+    if (kind === "userChoice" || kind === "format") return false;
+    return defaultEnabled();
+  }
+  // 通话模式：每一条都该开着。format 要开 —— 通话里那些功能是保留的
+  // （角色打电话时照样能转账、发卡片），只是不念出来
   return defaultEnabled();
 }
 
@@ -1091,18 +1364,50 @@ function defaultEnabledFor(kind, mode) {
  * 线下预设里的 format 也默认关 —— 线下不发气泡、没有语音表情包那一套，
  * 而且 buildPrompt 在线下会**无条件跳过**这一条，留着开着只会让用户以为它生效了。
  */
+/**
+ * 通话默认预设里「消息格式与功能」**默认关掉**的子条目（用户定的清单）。
+ *
+ * 只是默认数据：关着的子条目 prompt.js:formatBlock 本来就跳过、不注入，
+ * 用户想用哪条自己去预设里打开就行，不需要别的代码去拦。
+ * 前端 store.jsx 里有同一张表（新建通话预设时用），改的时候两处一起改。
+ */
+export const CALL_OFF_CHILDREN = [
+  "voice",
+  "search",
+  "leaveOnRead",
+  "quote",
+  "undoSend",
+  "effect",
+  "instagram",
+  "xiaohongshu",
+  ...SPY_CHILD_KINDS,
+];
+
+/** 通话预设那条「消息格式与功能」：引言留空（那是发短信的说法），清单里的子条目关掉。 */
+function callFormatEntry() {
+  return {
+    content: "",
+    children: defaultFormatChildren().map((c) =>
+      CALL_OFF_CHILDREN.includes(c.kind) ? { ...c, enabled: false } : c
+    ),
+  };
+}
+
 export function defaultEntries(mode = "online") {
   return fixedKindsFor(mode).map((kind, i) => ({
     id: `e-${i + 1}`,
     kind,
     enabled: defaultEnabledFor(kind, mode),
     ...(kind === "format"
-      ? { content: DEFAULT_FORMAT_INTRO, children: defaultFormatChildren() }
+      ? mode === "call"
+        ? callFormatEntry()
+        : { content: DEFAULT_FORMAT_INTRO, children: defaultFormatChildren() }
       : {}),
     // 记忆库那条也有可编辑的正文（四个变量的位置和外面的标签都在里面）
     ...(kind === "memory" ? { content: DEFAULT_MEMORY_ENTRY } : {}),
     ...(kind === "userChoice" ? { content: DEFAULT_USER_CHOICE } : {}),
     ...(kind === "onlineHistory" ? { content: DEFAULT_ONLINE_HISTORY } : {}),
+    ...(kind === "callHowto" ? { content: DEFAULT_CALL_HOWTO } : {}),
   }));
 }
 
@@ -1124,7 +1429,8 @@ export function makeDefaultPreset(overrides = {}) {
   const mode = PRESET_MODES.includes(overrides.mode) ? overrides.mode : "online";
   return normalizePreset(
     {
-      name: mode === "offline" ? "默认线下预设" : "默认预设",
+      name:
+        mode === "offline" ? "默认线下预设" : mode === "call" ? "默认通话预设" : "默认预设",
       params: { ...DEFAULT_PARAMS },
       entries: defaultEntries(mode),
       regex: defaultRegexRules(mode),
@@ -1156,7 +1462,7 @@ function normalizeParams(input) {
 }
 
 /**
- * 「消息格式与功能」的子条目：固定十九条、不能增删，只能开关和改内容。
+ * 「消息格式与功能」的子条目：固定二十二条、不能增删，只能开关和改内容。
  *
  * 老配置里没有 children 字段，得从那一整段 content 迁过来 —— 缺 `enabled` 的
  * 一律补成开（见 defaultChildEnabled）。以前这里还分「用户改没改过引言」，
@@ -1214,6 +1520,21 @@ function migrateSpyChildren(list, byKind) {
   }
 }
 
+/**
+ * 老版本的默认正文，只存 SHA-256。
+ *
+ * 和上面 legacyContent 一个用途（存着这段 = 没改过，换成新的），区别是原文
+ * **不能留在源码里**：「分享位置」以前的示例用的是作者本人所在城市的真实地名和
+ * 坐标，属于隐私。只存哈希照样认得出「没改过」，又不会把那句话再带进仓库。
+ */
+const LEGACY_CHILD_HASHES = {
+  location: ["daf280bc2165192d060daf6ffd6d2dceaf5db3c7a7289fa23f3ed7afa8985b1f"],
+};
+
+function sha256(text) {
+  return createHash("sha256").update(String(text)).digest("hex");
+}
+
 function normalizeFormatChildren(list) {
   const byKind = new Map();
   for (const raw of Array.isArray(list) ? list : []) {
@@ -1228,6 +1549,9 @@ function normalizeFormatChildren(list) {
     image: LEGACY_IMAGE_CHILD,
     // 加「回到当前聊天界面」之前那一版（见 LEGACY_SPY_CONTROL_CHILD）
     spyControl: LEGACY_SPY_CONTROL_CHILD,
+    // 加「[看菜单:…]」那句之前的瑞幸 / 麦当劳默认正文
+    luckin: DEFAULT_FORMAT_CHILDREN.luckin.replace(/没列菜单、或者想重新看一眼[^\n]*/, ""),
+    mcd: DEFAULT_FORMAT_CHILDREN.mcd.replace(/没列菜单、或者想重新看一眼[^\n]*/, ""),
   };
   return FORMAT_CHILD_KINDS.map((kind) => {
     const raw = byKind.get(kind);
@@ -1236,6 +1560,10 @@ function normalizeFormatChildren(list) {
       typeof raw?.content === "string" ? raw.content : DEFAULT_FORMAT_CHILDREN[kind];
     // 存着接链路之前那句默认正文 = 没改过，换成新格式
     if (content === legacyContent[kind]) content = DEFAULT_FORMAT_CHILDREN[kind];
+    // 只存了哈希的老默认正文（原文里有不该留在源码里的东西，见 LEGACY_CHILD_HASHES）
+    if (typeof content === "string" && LEGACY_CHILD_HASHES[kind]?.includes(sha256(content))) {
+      content = DEFAULT_FORMAT_CHILDREN[kind];
+    }
     return {
       id: `f-${kind}`,
       kind,
@@ -1313,6 +1641,26 @@ function normalizeEntries(list, mode = "online") {
     };
     if (kind === "format") {
       normalizeFormatEntry(entry, raw);
+      /*
+       * 通话预设里那条「消息格式与功能」还是**原样出厂**的（引言是发短信那两句、
+       * 要关的那几条一条都没关）= 用户没动过，换成通话的默认：引言清空、
+       * CALL_OFF_CHILDREN 关掉。子条目的正文不动。
+       *
+       * 只认「完全没动过」这一种 —— 用户哪怕关过其中一条、或者改过一个字的引言，
+       * 都当他有自己的打算，原样留着。迁移完引言是空的，不会再触发第二次。
+       */
+      if (
+        mode === "call" &&
+        entry.content === DEFAULT_FORMAT_INTRO &&
+        entry.children
+          .filter((c) => CALL_OFF_CHILDREN.includes(c.kind))
+          .every((c) => c.enabled)
+      ) {
+        entry.content = "";
+        entry.children = entry.children.map((c) =>
+          CALL_OFF_CHILDREN.includes(c.kind) ? { ...c, enabled: false } : c
+        );
+      }
     } else if (kind === "memory") {
       // 老配置里这条是纯占位、没有 content 字段，缺了就补上默认正文 ——
       // 不补的话升级上来的用户会看到一条空的记忆库条目，什么都不注入
@@ -1323,6 +1671,19 @@ function normalizeEntries(list, mode = "online") {
       // 用户可能把 {{线上聊天记录}} 挪过位置或整行删掉（删掉 = 这条不要记录），
       // 只补「缺字段」的默认正文，别去动他已经改过的文字
       entry.content = raw?.content === undefined ? DEFAULT_ONLINE_HISTORY : str(raw.content);
+    } else if (kind === "callHowto") {
+      // 同上：只补「缺字段」的，用户改过的照原样留着。
+      // 漏了这一支的后果很隐蔽 —— 条目还在、开关也开着，但正文是空的，
+      // 于是整段「电话里怎么说话」压根没进提示词，角色照着发短信的路子念括号
+      // 存着以前哪一版的默认正文 = 没改过，换成新的（v1.20.1 还带「那些功能照样能用」，
+      // v1.20.2 还没有「摄像头」那一节，v1.21.9 还没有「语气」那一节）
+      entry.content =
+        raw?.content === undefined ||
+        raw.content === LEGACY_CALL_HOWTO ||
+        raw.content === CALL_HOWTO_V1202 ||
+        raw.content === CALL_HOWTO_V1219
+          ? DEFAULT_CALL_HOWTO
+          : str(raw.content);
     } else if (kind === "custom") {
       // 从线下降回线上时，那条用户选项落到这里 —— 名字给一个，不然界面上
       // 是一条无名条目，用户不知道这段文字打哪来的
@@ -1348,6 +1709,16 @@ function normalizeEntries(list, mode = "online") {
     if (kind === "memory") entry.content = DEFAULT_MEMORY_ENTRY;
     if (kind === "userChoice") entry.content = DEFAULT_USER_CHOICE;
     if (kind === "onlineHistory") entry.content = DEFAULT_ONLINE_HISTORY;
+    /*
+     * 漏了这一行的后果很隐蔽，而且踩到了：新建一份通话预设时「怎么打电话」
+     * 那条**条目在、开关也开着、正文是 undefined** —— 于是整段「电话里怎么
+     * 说话」压根没进提示词（里面包括「想挂电话就写 [结束通话]」那一段），
+     * 角色照着发短信的路子念括号、也不知道自己能挂电话。
+     *
+     * 上面那个循环（改已有条目）早就处理了 callHowto，只有这个「补齐缺的」
+     * 分支漏了，所以老预设正常、新建的坏 —— 最难想到的那种。
+     */
+    if (kind === "callHowto") entry.content = DEFAULT_CALL_HOWTO;
     out.push(entry);
   }
 
@@ -1428,7 +1799,16 @@ export function presetLabel(preset) {
 /** 这个 mode 下能挑的预设。缺 mode 字段的老预设算线上。 */
 export function presetsFor(config, mode = "online") {
   const want = PRESET_MODES.includes(mode) ? mode : "online";
-  return (config?.presets ?? []).filter((p) => (p?.mode === "offline" ? "offline" : "online") === want);
+  /*
+   * 缺 mode 字段的老预设算线上。
+   *
+   * 注意不能写成「不是 offline 就是 online」—— 那样 call 模式一份都筛不出来，
+   * 会静默回落到内置的默认通话预设，用户改了自己那份却看不到任何变化。
+   */
+  return (config?.presets ?? []).filter((p) => {
+    const m = PRESET_MODES.includes(p?.mode) ? p.mode : "online";
+    return m === want;
+  });
 }
 
 /**
@@ -1452,7 +1832,12 @@ export function presetsFor(config, mode = "online") {
 export function resolvePreset(config, role, mode = "online") {
   const want = PRESET_MODES.includes(mode) ? mode : "online";
   const presets = presetsFor(config, want);
-  const ref = want === "offline" ? role?.offline?.presetRef : role?.presetRef;
+  const ref =
+    want === "offline"
+      ? role?.offline?.presetRef
+      : want === "call"
+        ? role?.call?.presetRef
+        : role?.presetRef;
   if (!presets.length) return makeDefaultPreset({ mode: want });
   return presets.find((p) => p.id === ref) ?? presets[0];
 }

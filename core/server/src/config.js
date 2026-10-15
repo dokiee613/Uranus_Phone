@@ -14,6 +14,7 @@ import {
   migrateLegacyLayout,
   readCollection,
   readJson,
+  topUpCallPreset,
   writeCollection,
   writeJson,
 } from "./datadir.js";
@@ -24,6 +25,8 @@ import {
   DEFAULT_STYLE_REF,
   DEFAULT_TODO_PROMPT,
 } from "./memoryprompts.js";
+// 共感娃娃：轮询区间、判定阈值的默认值、那句系统提示的默认文案都在 doll.js 定义一处
+import { DOLL_DEFAULTS, HUG_TEMPLATE_RICH, POLL_MAX_MS, POLL_MIN_MS } from "./doll.js";
 // 13 个消息特效的 key 只在 media.js 列一处，这里跟着它收口
 import { EFFECT_KEYS } from "./media.js";
 // 能点歌的曲库只在 music.js 列一处，这里跟着它收口
@@ -420,7 +423,7 @@ export const DEFAULT_CONFIG = {
   // 发送节奏是全局的：几个角色打字的手感一致
   chat: {
     separator: "$", // 气泡分隔符
-    // 强制分隔：不认 $，改按逗号句号换行空格切。和 separator 是互斥的两条路
+    // 强制分隔：不认 $，改按逗号句号换行切（空格不算）。和 separator 是互斥的两条路
     forceSeparator: false,
     queueWait: 8, // 收到消息后合并等待时间（秒）
     delay: {
@@ -558,6 +561,9 @@ export const DEFAULT_CONFIG = {
         modelId: "",
         maxClips: 2,
         emotion: false,
+        // 用专门的 STT 还是这个多模态模型。auto = 配了 STT 且没开情绪识别就用
+        // STT，见 normalizeRole 里那段
+        source: "auto",
       },
       // 看视频：把对方发来的视频转成一段描述再喂给聊天模型。也默认关 ——
       // 一段十几 MB 的视频上传要几十秒、按 token 算也比图片贵得多，
@@ -626,6 +632,10 @@ export const DEFAULT_CONFIG = {
     // WeatherAPI（国外）：地址内置，只要一把 key
     weatherapi: { key: "" },
   },
+  // 瑞幸点单的 token（luckin.js），只写 data.config.json
+  luckinApi: { token: "" },
+  // 麦当劳点单的 token（open.mcd.cn/mcp），同上。点单链路还没接，先能填能测
+  mcdApi: { token: "" },
   // 联网搜索的密钥，同样全局一份（只写 data.config.json）。
   // 两个都没开 = 走 DuckDuckGo 的 HTML 端点（免费、无密钥，但不保证稳定）
   searchApi: {
@@ -661,6 +671,124 @@ export const DEFAULT_CONFIG = {
     // 空 = 那个功能用不了（歌单 ID 没有公开接口能按名字查，见 normalizeSpyPlaylists）
     playlists: [],
   },
+  /*
+   * 共感娃娃那条腿，全局一份。
+   *
+   * 和 spyApi 一个道理：这一套（手机的局域网地址、phyphox 里那几个 buffer 的
+   * 名字、判定阈值）描述的是**用户那部塞在玩偶里的手机**，和哪个角色在听无关。
+   * 每个角色配一份的话，换个 WiFi 得在界面上改 N 遍。
+   *
+   * 整块进密钥文件：`host` 是内网地址，和 sovits 那条一个理由 —— 不该进能
+   * 分享出去的那份配置。开关也在这块里，所以整块从密钥文件读回来
+   * （见 mergeSecrets）。
+   *
+   * host 空 = 整条腿不通（角色那边开了「共感娃娃」也没有信号进来）。
+   */
+  dollApi: {
+    enabled: false,
+    /*
+     * 哪一头主动：
+     *
+     *  - `pull`（默认）：服务端定时去读手机上 phyphox 的远程接口。**要求两边
+     *    在同一个网里**，自己电脑上跑的时候最省事，手机上不用装任何东西。
+     *  - `push`：手机按我们生成的实验文件，自己定时 POST 过来。**服务端在哪
+     *    都行** —— VPS、小手机（Worker）只能走这条。
+     *
+     * 见 doll.js 文件头「两种接法」。
+     */
+    mode: "pull",
+    // 手机上 phyphox 显示的那个地址。安卓一般是 8080，iPhone 默认 80。只有拉模式用
+    host: "",
+    /*
+     * 推模式这三样：手机要打到哪个公网地址、凭什么证明是它、多久推一次。
+     *
+     * `pushUrl` 只填到域名/端口（比如 `https://chat.example.com`），路径由
+     * doll.js:DOLL_PUSH_PATH 固定补上 —— 那个地址要抄进手机上的实验文件，
+     * 少一处能填错的地方。
+     *
+     * `pushSecret` 空着 = 推这条腿不通。和 spyApi.webhookSecret 一个道理：
+     * 不能默认开一个谁都能往里打的口子，那等于把「角色被抱了」交给公网。
+     */
+    pushUrl: "",
+    pushSecret: "",
+    pushRate: 20,
+    pushInterval: 2,
+    /*
+     * phyphox 里那个实验的 buffer 名。默认值按它自带的「Acceleration without g」
+     * （线性加速度）猜的 —— 面板上「测试连接」会把手机上真实的名字列出来，
+     * 对不上让用户自己改。
+     */
+    magnitude: "acc",
+    time: "acc_time",
+    // 遮挡（接近 / 光线）buffer，可留空。填了之后「抱着不动」也能算进时长，
+    // 见 doll.js:feedDollSamples
+    cover: "",
+    coverBelow: 5,
+    // 轮询间隔（毫秒）。phyphox 那个服务器单线程而且慢，不能太密，见 doll.js 文件头
+    intervalMs: 400,
+    // 实验停着时替用户按一下「开始」（手机上开着 phyphox 但没点播放的情况）
+    autoStart: true,
+    // 判定阈值，含义和默认值的来路都在 doll.js:DOLL_DEFAULTS
+    start: 2,
+    hold: 0.25,
+    quietMs: 4000,
+    minHoldMs: 1500,
+    soft: 4,
+    firm: 10,
+  },
+  /*
+   * 语音转文字（STT）的凭据，全局一份（只写 data.config.json）。
+   *
+   * 两条路共用：iMessage 的语音条、FaceTime 通话。三家都没开 = 退回原来那条
+   * 多模态模型的路（role.audioModel），见 stt.js 文件头。
+   */
+  sttApi: {
+    /*
+     * 说的是哪种语言。默认中文。
+     *
+     * 不填的话 whisper 自己猜，而**通话里的片段又短又吵**，它猜错的概率高得
+     * 离谱 —— 实测一通中文电话被认成冰岛语、韩语、俄语，转写出来是一串没有
+     * 意义的谚文。给了语言之后它不再猜，而且更快一点。
+     *
+     * 只在固定说某一种语言时留空（让它每段自己判）。
+     */
+    language: "zh",
+    // OpenAI 兼容的 /audio/transcriptions。最通用，中转站普遍支持
+    openai: { enabled: false, key: "", url: "", model: "whisper-1", prompt: "" },
+    // 阿里云 Qwen3-ASR：走 OpenAI 兼容的 chat 接口，中文好、有免费额度
+    qwen: { enabled: false, key: "", url: "", model: "qwen3-asr-flash", prompt: "" },
+    // 讯飞语音听写：国内节点、中文最好、延迟最低，但要三个凭据
+    xfyun: { enabled: false, appId: "", apiKey: "", apiSecret: "" },
+  },
+
+  /*
+   * FaceTime 通话节点。整块只住密钥文件 —— 配对密钥等于一把能让别人往你的
+   * 通话里塞话的钥匙，和 dollApi 的 pushSecret 一个待遇。
+   *
+   * 节点是一个**独立的程序**，跑在一台有浏览器的机器上（可以是这一台，也可以是
+   * 别的机器）。Uranus 本体跑在 CF Worker 或安卓上时起不了浏览器，所以这个功能
+   * 必须拆成两半 —— 见 facetime-node/设计.md。
+   */
+  callNode: {
+    enabled: false,
+    /*
+     * 谁连谁。
+     *  "node"   节点主动连 Uranus（默认）。Uranus 有公网地址时用这个，
+     *           节点可以躲在家里的路由器后面，没有公网 IP 也行。
+     *  "uranus" Uranus 主动连节点。Uranus 在本地电脑、节点在公网 VPS 时用这个。
+     */
+    direction: "node",
+    /** direction = "uranus" 时，节点的地址（如 http://1.2.3.4:8788）。 */
+    url: "",
+    /** 配对密钥。两边必须一致，节点那头靠它证明自己是谁。同机的节点用不上 */
+    secret: "",
+    /*
+     * 本机的节点不用配对码（别的机器上的照旧要）。默认开 —— 绝大多数人
+     * 就是同机跑。理由见 normalizeCallNode。
+     */
+    trustLocal: true,
+  },
+
   // 语音合成（TTS）的凭据，同样全局一份（只写 data.config.json）。
   // 四家都没开 = 角色就算打开了「发语音」也发不出来，退化成文字，见 media.js
   ttsApi: {
@@ -1126,6 +1254,15 @@ function normalizeModelRef(input, fallbackRef) {
  * 不从那边 import：theater.js 反过来要 import 这个文件，模块顶层互相读常量会撞上
  * 「还没初始化」。
  */
+/** 小剧场「生成后注入」的三档。老配置里的布尔也认，见 normalizeTheater 那段注释。 */
+const INJECT_MODES = ["off", "all", "picked"];
+
+function normalizeInjectMode(input) {
+  if (INJECT_MODES.includes(input)) return input;
+  // 老配置：true / "true" / 1 / "1" 都当「全部注入」，其余（含 undefined）当关
+  return [true, "true", 1, "1"].includes(input) ? "all" : "off";
+}
+
 function normalizeTheater(input) {
   return {
     // 用哪个模型生成。空 = 还没选，生成时报错让用户去选
@@ -1144,9 +1281,18 @@ function normalizeTheater(input) {
     /*
      * 生成后注入当前会话（照插件 inject_after_generation）：只在 iMessage 里用指令生成时，
      * 等 5 秒把「注入提示词 + 小剧场提示词 + 正文」当一轮交给角色回复，这一轮进会话历史。
-     * 默认关，和插件一致。
+     *
+     * 三档：
+     *   "off"    不注入（默认，和插件一致）
+     *   "all"    每次生成完都注入
+     *   "picked" 只有在模板上勾了「生成后注入」的那些才注入。临时提示词
+     *            （/临时小剧场）这条路没有模板可勾，这一档下一律不注入。
+     *
+     * 老配置里这是个布尔：`true` → "all"，`false` / 缺字段 → "off"。也认它的
+     * 字符串形态（手机上改过、或从 JSON 捞回来的），和 chat.forceSeparator 一个路子。
+     * 判断「这一次要不要注入」在 theater.js:shouldInject。
      */
-    injectAfterGeneration: Boolean(input?.injectAfterGeneration),
+    injectAfterGeneration: normalizeInjectMode(input?.injectAfterGeneration),
     // 注入时带不带小剧场提示词。缺字段算开，和插件默认一致
     injectTheaterPrompt: input?.injectTheaterPrompt !== false,
     // 注入提示词。没这个字段 = 插件原版那句；用户清空 = 不加（插件「留空时不注入此提示词」）
@@ -1205,6 +1351,22 @@ function normalizeRole(input, id, legacy) {
       enabled: Boolean(input?.audioModel?.enabled),
       maxClips: clampInt(input?.audioModel?.maxClips, 2, 1, 10),
       emotion: Boolean(input?.audioModel?.emotion),
+      /*
+       * 语音条用哪条路转写：
+       *   "auto"  配了专门的 STT 就用它，没配 / 开了情绪识别才用多模态（默认）
+       *   "stt"   只用专门的 STT（`config.sttApi`）
+       *   "model" 只用多模态模型（下面那个 audioModel 引用）
+       *
+       * 为什么要显式选，而不是光靠「情绪识别」那个开关推：开着情绪识别
+       * 就一律走多模态，是一条**藏起来的规则** —— 用户配好了 STT、看到
+       * 日志里还在打 gemini-3.8-flash，没办法从界面上看出为什么。
+       *
+       * 默认 auto 让老配置行为不变。通话那条路不看这个字段（电话里永远
+       * 优先 STT，六段式报告在电话里是灾难，见 callturn.js:transcribe）。
+       */
+      source: ["auto", "stt", "model"].includes(input?.audioModel?.source)
+        ? input.audioModel.source
+        : "auto",
     },
     /*
      * 看视频。同样没有 legacy 分支，同样默认**关**。
@@ -1255,6 +1417,9 @@ function normalizeRole(input, id, legacy) {
     spy: normalizeSpy(input?.spy),
     // 发语音、生图：同样只有开关。凭据和模型都是全局的，见下面两个函数
     voiceSend: normalizeVoiceSend(input?.voiceSend),
+    // 接 FaceTime：开关 + 通话预设 + 单独的模型 + 几个节奏参数。
+    // 节点地址和配对密钥是全局的（config.callNode），见下面那个函数
+    call: normalizeRoleCall(input?.call),
     imageGen: normalizeImageGen(input?.imageGen),
     // 发表情包：开关 + 标签黑名单。图片是用户自己硬盘上的，不花钱但也不该
     // 所有角色共用一套（见 normalizeStickerSend）
@@ -1265,6 +1430,16 @@ function normalizeRole(input, id, legacy) {
     locationSend: normalizeLocationSend(input?.locationSend),
     // 转账卡片：开关 + 卡片上那行小字。见下面那个函数
     transfer: normalizeTransfer(input?.transfer),
+    // 瑞幸点单：开关 + 先看菜单 + 取餐码提醒 + 确认时限。token 是全局的（config.luckinApi），
+    // 见下面那个函数和 luckin.js
+    luckin: normalizeLuckin(input?.luckin),
+    // 定时提醒：只有开关。条目和默认提前量不在 config 里（data/reminders.json，见 reminder.js）
+    reminder: { enabled: Boolean(input?.reminder?.enabled) },
+    // 共感娃娃：开关 + 那句系统提示的文案 + 冷却。手机地址和阈值在全局的
+    // dollApi 上（那描述的是「用户那部手机」，不属于哪个角色），见下面那个函数
+    hug: normalizeHug(input?.hug),
+    // 麦当劳点单：开关 + 默认外送还是到店 + 自动带菜单 + 确认时限，见 mcd.js
+    mcd: normalizeMcd(input?.mcd),
     // 消息回应、消息特效：开关 + 白名单。两条都是「勾了才能用」，
     // 一个都没勾就整条不进提示词（省 token），见下面那两个函数
     reactSend: normalizeReactSend(input?.reactSend),
@@ -1686,7 +1861,7 @@ function normalizeCardSend(input) {
 /**
  * 分享位置：只有开关。
  *
- * 模型写 `[location:南宁万象城]`，服务端拼一条 maps.apple.com 的网址、照卡片
+ * 模型写 `[location:上海外滩]`，服务端拼一条 maps.apple.com 的网址、照卡片
  * 那条路发出去（见 card.js:mapsUrlFor 和 imessage.js:sendLocationPart）。
  * iMessage 没有「原生位置气泡」那种 content 类型，能做到的就是一张点开跳地图
  * 的链接卡片。
@@ -1829,6 +2004,57 @@ function normalizeTransfer(input) {
 }
 
 /**
+ * 瑞幸点单（luckin.js）。
+ *
+ * **默认关**：开着就意味着这个角色能替用户下真单（虽然最后一步要用户贴 emoji
+ * 确认），这只能由用户自己决定。
+ *
+ *  - menu：「自动带上菜单」—— 聊到咖啡、又没有进行中的订单时，调模型之前先查附近门店的
+ *    菜单（商品 + 价格 + 规格）放进提示词，角色一次就能挑。默认开；关掉省那几百 token，
+ *    角色凭自己知道的菜单点。
+ *  - pickupNotify：下单后隔一会儿查一次订单，查到取餐码就让角色告诉对方。
+ *    默认关：查到之后要起一轮回复，花 token。
+ *  - confirmMinutes：订单卡片多久之内贴 emoji 算数。超了卡片改成「已失效」，不下单 ——
+ *    隔了一晚上的价格和券早就不作数了。
+ *  - appName：卡片上方那行小字（和转账卡片的 appName 一个位置）。
+ */
+function normalizeLuckin(input) {
+  return {
+    enabled: Boolean(input?.enabled),
+    menu: input?.menu === undefined ? true : Boolean(input.menu),
+    pickupNotify: Boolean(input?.pickupNotify),
+    confirmMinutes: clampInt(input?.confirmMinutes, 30, 1, 240),
+    appName: str(input?.appName).slice(0, 40),
+  };
+}
+
+/**
+ * 麦当劳点单（mcd.js）。和瑞幸同一套，多一个 mode：默认外送（送到对方麦当劳账号里的
+ * 地址）还是到店。麦当劳没有查订单的接口，所以没有取餐码提醒。默认关，理由同瑞幸。
+ */
+function normalizeMcd(input) {
+  return {
+    enabled: Boolean(input?.enabled),
+    mode: input?.mode === "pickup" ? "pickup" : "delivery",
+    // 自动领券：配单 / 查菜单前把麦麦省里能领的券领进账号（不花钱，6 小时一次），默认开
+    autoCoupon: input?.autoCoupon === undefined ? true : Boolean(input.autoCoupon),
+    // 外送送到麦当劳账号里的哪个地址。空着 = 按「你」里的常用地址猜（mcd.js:pickAddress）
+    addressId: str(input?.addressId).slice(0, 80),
+    menu: input?.menu === undefined ? true : Boolean(input.menu),
+    confirmMinutes: clampInt(input?.confirmMinutes, 30, 1, 240),
+    appName: str(input?.appName).slice(0, 40),
+  };
+}
+
+/**
+ * 瑞幸点单的 token，全局一份，和 searchApi 一个待遇（只写 data.config.json）。
+ * 来自 open.lkcoffee.com，每个人自己的，大约一个月过期。
+ */
+function normalizeLuckinApi(input) {
+  return { token: str(input?.token).trim().slice(0, 2000) };
+}
+
+/**
  * 聊天背景变更提示：对方换了 iMessage 聊天背景时，在下一条消息里带一句
  * 系统提示（`[系统提示:{{user}}更改了当前聊天背景]`）。
  *
@@ -1941,6 +2167,246 @@ function normalizeVoiceSend(input) {
     language: str(input?.language).trim().toLowerCase(),
     // 口音标签的内容，如 "strong British accent"。方括号由 media.js 拼，这里剥掉用户手写的
     accent: str(input?.accent).replace(/[[\]［］]/g, "").trim(),
+  };
+}
+
+/**
+ * 语音转文字的凭据。**整块只住密钥文件**（和 ttsApi 一样），所以 enabled
+ * 也在里面 —— config.json 那份是整块抹空的，分开存的话重启后空结构会把
+ * 开关盖成 false。
+ */
+function normalizeSttApi(input) {
+  const i = input ?? {};
+  return {
+    /*
+     * 语言。**没有这个字段**（老配置、第一次启动）当成中文，不是「自动」——
+     * 自动是坏的默认值，见 DEFAULTS 里那段。用户想要自动得自己把它清空，
+     * 那时字段是空串、不是 undefined，这里分得开。
+     */
+    language:
+      i.language === undefined || i.language === null
+        ? "zh"
+        : str(i.language).trim().toLowerCase(),
+    openai: {
+      enabled: Boolean(i.openai?.enabled),
+      key: str(i.openai?.key).trim(),
+      // 空 = 用 OpenAI 官方。填中转站的话写到 /v1 为止
+      url: str(i.openai?.url).trim().replace(/\/+$/, ""),
+      model: str(i.openai?.model).trim() || "whisper-1",
+      // 给模型一点上下文能提高专有名词的准确率（人名、游戏名那些）
+      prompt: str(i.openai?.prompt).slice(0, 400),
+    },
+    qwen: {
+      enabled: Boolean(i.qwen?.enabled),
+      key: str(i.qwen?.key).trim(),
+      url: str(i.qwen?.url).trim().replace(/\/+$/, ""),
+      model: str(i.qwen?.model).trim() || "qwen3-asr-flash",
+      /*
+       * 专有名词表（人名、地名）。走的是 Qwen3-ASR 的 system 消息 ——
+       * 那一条在这个接口里**专门用来放背景文本和实体词表**，不是传统的
+       * 系统提示词（写指令进去不管用，见 stt.js:sttQwen）。
+       */
+      prompt: str(i.qwen?.prompt).slice(0, 400),
+    },
+    xfyun: {
+      enabled: Boolean(i.xfyun?.enabled),
+      appId: str(i.xfyun?.appId).trim(),
+      apiKey: str(i.xfyun?.apiKey).trim(),
+      apiSecret: str(i.xfyun?.apiSecret).trim(),
+    },
+  };
+}
+
+/**
+ * 通话节点的地址和配对密钥。
+ *
+ * **整块只住密钥文件**（和 ttsApi / dollApi 一样），所以 `enabled` 这个开关
+ * 也在密钥文件里 —— config.json 那份是整块抹空的，分开存的话重启之后空结构
+ * 会把开关盖成 false（这个坑 config.js:3441 附近的注释讲过）。
+ */
+function normalizeCallNode(input) {
+  const dir = input?.direction === "uranus" ? "uranus" : "node";
+  /*
+   * 节点在不在本机。只是界面上那个「节点在哪」的选择，连接逻辑不看它 ——
+   * 真正起作用的是 direction 和 trustLocal（界面选「在本机」时一并设成
+   * node + true，「不在本机」设 trustLocal = false）。
+   *
+   * 老配置没有这个字段：Uranus 去连节点、或者关了本机免配对的算不在本机，
+   * 其余算在本机。和 role.jsx:callNodeIsLocal 同一个判据。
+   */
+  const where =
+    input?.where === "local" || input?.where === "remote"
+      ? input.where
+      : dir === "uranus" || input?.trustLocal === false
+        ? "remote"
+        : "local";
+  return {
+    enabled: Boolean(input?.enabled),
+    where,
+    direction: dir,
+    // 去掉末尾的斜杠，拼路径时就不用判了
+    url: str(input?.url).trim().replace(/\/+$/, ""),
+    secret: str(input?.secret).trim(),
+    /*
+     * 本机的节点不用配对码。默认开。
+     *
+     * 开着的时候，从本机直连上来的节点（回环地址、没经过反代、不是浏览器
+     * 发的）不校验密钥。于是同机那条路零配置：装好节点直接跑。
+     *
+     * **这是多一条路，不是换一条路**：别的机器上的节点照旧用配对码连，
+     * 一点不受影响。早先的写法是「开着就只收本机、外面来的密钥对了也拒」，
+     * 那会把已经配对好的远程节点一更新就踢掉。
+     *
+     * ── 这么做安不安全 ──
+     *
+     * 回环在这儿不是一道真的防线：能在这台机器上跑进程的人，直接读
+     * `data.config.json` 就拿到了你全部的 API 密钥和手机号 —— 比插进一通
+     * 电话严重得多。为一个挡不住任何东西的边界，让每个本机用户都走一遍
+     * 生成密钥、复制、粘贴，不划算。
+     *
+     * 真正要挡的两种「看起来像本机」—— 反代后面的公网请求、本机浏览器里
+     * 某个网页发的请求 —— 在 callapi.js:isLoopback 里单独认出来拒掉。
+     */
+    trustLocal: input?.trustLocal !== false,
+  };
+}
+
+/**
+ * 接 FaceTime 通话：这个角色接不接、用哪份通话预设、哪个模型、什么节奏。
+ *
+ * **默认关。** 和 proactive / voiceSend 一样是会花钱的功能 —— 而且这个还要求
+ * 另外跑一个通话节点，不是打开开关就能用的。
+ *
+ * 声音用的是 `voiceSend.voiceId` 那个音色，不另配一个：打电话和发语音条是
+ * 同一个角色的同一个声音，分成两处设置只会让用户困惑「为什么电话里是另一个人」。
+ * 但**开关是独立的** —— 不开「发语音」也能接电话（电话里本来就该说话）。
+ *
+ * 三个模型/预设引用都只存**引用**，绝不存密钥（角色文件会被
+ * `backup.js:buildBundle` 原样打进可分享的备份包）。
+ */
+function normalizeRoleCall(input) {
+  return {
+    enabled: Boolean(input?.enabled),
+
+    /*
+     * 通话预设（`preset.mode === "call"`）。和 `role.presetRef`、
+     * `role.offline.presetRef` 是三个独立的引用，失效同样不清理 ——
+     * 退回内置的那份默认通话预设，见 preset.js:defaultCallPreset。
+     */
+    presetRef: str(input?.presetRef),
+
+    /*
+     * 通话单独用哪个模型。空 = 用角色的主聊天模型。
+     *
+     * 很值得单独配：通话对延迟敏感得多，带 thinking 的模型在电话里是灾难
+     * （实测主模型想了 7.3 秒才开口）。解析见 callturn.js:callEndpoint。
+     */
+    model: normalizeModelRef(input?.model),
+
+    /*
+     * 通话这一轮要不要让模型少思考。默认**开**。
+     *
+     * 实测第二通电话：`gemini-3.8-flash` 每轮 `completion_tokens` 611–2212，
+     * 实际说出来的只有 23–67 字 —— 差的全是思考，一轮等 8 到 25 秒。打电话
+     * 的人不会等这个。
+     *
+     * 默认开着是因为**通话里思考几乎没有收益**：电话里说的是两三句口语，
+     * 不是解数学题。想要它多想想的话这儿关掉。
+     *
+     * 能关到什么程度各家不一样（Gemini 3 一代关不掉，只能压到最低档），
+     * 发什么字段、被拒了怎么降档都在 llm.js:THINKING_LADDER。
+     */
+    noThinking: input?.noThinking !== false,
+
+    /*
+     * 通话单独挂哪几本世界书。**空 = 跟着线上那份走**（`role.worldBookRefs`）。
+     *
+     * 和线下那份（`role.offline.worldBookRefs`）不是一个规矩，这是刻意的：
+     * 线下是「另一份书单」，空着就真的一本都不挂（剧情要的设定和聊天要的
+     * 往往不是同一批）；通话和短信共用同一条历史、同一个场景，**默认该一样**，
+     * 只有嫌 19k token 的提示词太慢时才单独挑几本薄的。
+     *
+     * global 的书两边都照旧生效，和另外两条路一致。解析在 prompt.js。
+     */
+    worldBookRefs: Array.isArray(input?.worldBookRefs)
+      ? [...new Set(input.worldBookRefs.map((r) => str(r).trim()).filter(Boolean))]
+      : [],
+
+    /*
+     * 对方插话时要不要打断角色。默认**开**。
+     *
+     * 两个参考项目都没做打断（都是角色说话时干脆不开麦），因为误判的代价
+     * 不小 —— 一声咳嗽就把角色的话拦腰截断。所以节点那边判得比普通
+     * 静音检测严得多（要连着响满 500ms），并且这个开关留给用户关掉。
+     */
+    bargeIn: input?.bargeIn !== false,
+
+    /*
+     * 听语气。默认**开**。
+     *
+     * 用 Qwen3-ASR 转写的话，它每次都顺带回一个情绪标签（开心 / 难过 / 生气 /
+     * 惊讶 / 害怕 / 嫌弃），**不多花钱、不多花时间**；平静的不报。走多模态转写的
+     * 话，提示词里多一句「语气明显才另起一行写」。别家专门的转写不给情绪，那就没有。
+     * 给角色看的是 `[{{user}}的语气：开心]`，见 callturn.js:callUserMessage。
+     */
+    hearTone: input?.hearTone !== false,
+
+    /*
+     * 听背景声音（在街上、车里、旁边有人说话……）。默认**开**。
+     *
+     * 用角色的「听音」模型在后台听，**30 秒最多一次**，**不等它** —— 结果晚一轮
+     * 才告诉角色，所以不拖慢回话。和上次差不多就不报，免得角色一直念叨
+     * 「你那边好吵」。没配「听音」模型就听不了（专门的转写服务只转字）。
+     * 见 callturn.js:listenAmbience。
+     */
+    hearAmbience: input?.hearAmbience !== false,
+
+    /*
+     * 看摄像头（角色看得到对方）。默认**开**。
+     *
+     * 对方一开口，节点从 FaceTime 的视频里截一帧，用角色的「识图」模型描述成一句话，
+     * 以 `[{{user}}的摄像头画面：……]` 贴进这一轮；和上一张差不多就不报。识图和
+     * 「对方说话 + 转写」同时跑，一般不拖慢回话。没开摄像头、没配识图模型就当语音通话
+     * （默认通话预设「摄像头」那一节叫模型别编）。见 callturn.js:seeFrame。
+     */
+    seeCamera: input?.seeCamera !== false,
+
+    /*
+     * 对方多久没说话就提醒模型一次，秒。0 = 不提醒。
+     *
+     * 默认 45 秒（用户定的）。通话里 30 秒不说话其实很常见（在找东西、
+     * 在看屏幕），太短会让角色一直在问「还在吗」。
+     *
+     * 推给模型的那句话**不替它下结论**说「关麦了」—— 静音检测会误判，
+     * 所以只报现象，让角色按人设自己判断。见 calltags.js:silenceNotice。
+     */
+    silenceNotice: clampInt(input?.silenceNotice, 45, 0, 600),
+
+    /*
+     * 接通之后等多久再开口，毫秒。默认 1500。
+     *
+     * 不是为了「像真人一样顿一下」（虽然顺带有这个效果），是**技术上必须**：
+     * 接通那一刻上行的语音通道还没热起来（编码器可能还在静音抑制里、对方
+     * 那头的抖动缓冲是空的），立刻开口头上几个字会被吃掉。
+     *
+     * 实测过：v1.19.1 把开场白改成提前合成、接通瞬间就播之后，这个问题
+     * 马上出现。节点那边还铺了一层 -54dBFS 的底噪防静音抑制
+     * （fakemedia.mjs），两道一起用。
+     *
+     * 还吞字就往上调（2000～2500）；觉得接起来太久没声音就往下调。
+     */
+    openingDelayMs: clampInt(input?.openingDelayMs, 1500, 0, 10_000),
+
+    /** 角色入会之后先说的那句话的提示。空 = 让模型自己想。 */
+    greeting: str(input?.greeting).trim(),
+
+    /**
+     * 角色决定接之前，先在 iMessage 里回一句什么（比如「等我一下」）。
+     *
+     * 空 = 什么都不发，直接入会。留这个口子是因为入会要几秒，这期间
+     * 对方那头是静悄悄的。
+     */
+    pickingUpTemplate: str(input?.pickingUpTemplate).trim(),
   };
 }
 
@@ -2092,6 +2558,12 @@ function normalizeRoleEnv(input) {
       charCity: str(time.charCity).trim(),
       // 工作日与节假日感知，默认开
       workday: time.workday === undefined ? true : Boolean(time.workday),
+      // 提前感知：节日、生日、纪念日提前几天写进时间戳（「明天万圣节」），0 = 只在当天。默认 1
+      aheadDays: Number.isFinite(Number(time.aheadDays)) && time.aheadDays !== ""
+        ? Math.max(0, Math.min(7, Math.round(Number(time.aheadDays))))
+        : 1,
+      // 节日（万圣节、七夕、母亲节……）进不进时间戳，默认开。生日纪念日不受它管（reminder.js）
+      festivals: time.festivals === undefined ? true : Boolean(time.festivals),
     },
     weather: {
       enabled: Boolean(weather.enabled),
@@ -2300,6 +2772,101 @@ function normalizeSpyApi(input) {
     // 预设歌单（见 normalizeSpyPlaylists）。和上面几个字段一样是「用户那部手机」
     // 的事，不属于哪个角色，所以也在这块、也跟着整块进密钥文件
     playlists: normalizeSpyPlaylists(input?.playlists),
+  };
+}
+
+/**
+ * 共感娃娃那条腿的配置，全局一份、所有角色共用。
+ *
+ * 为什么是全局、为什么整块进密钥文件：见 DEFAULT_CONFIG.dollApi 的注释。
+ *
+ * 阈值一个都不留空：空着的话 doll.js 那边每次都得 `?? 默认值`，而「用户把
+ * 输入框清空了」和「这个版本还没有这个字段」在那边长得一模一样。钳到区间里
+ * 的具体理由见 doll.js:DOLL_DEFAULTS —— 这儿只管别让它变成 NaN 或者负数。
+ */
+function normalizeDollApi(input) {
+  return {
+    enabled: Boolean(input?.enabled),
+    // 认不出来的一律当 pull —— 老配置里压根没这个字段，而它们都是拉模式
+    mode: input?.mode === "push" ? "push" : "pull",
+    // 用户可能连 http:// 一起粘进来，留着原样 —— 补协议是 doll.js:dollUrl 的事
+    host: str(input?.host).trim(),
+    // 末尾的斜杠掐掉：拼路径时固定补 DOLL_PUSH_PATH，留着会拼出 `//doll/hug`
+    pushUrl: str(input?.pushUrl).trim().replace(/\/+$/, ""),
+    pushSecret: str(input?.pushSecret).trim(),
+    /*
+     * 采样率。上限 100Hz：再高手机那边每包就是几千个样本，而判定一次拥抱
+     * 二十来 Hz 绰绰有余（抱起来那一下持续好几百毫秒）。下限 5Hz：再低会
+     * 整个错过尖峰，于是永远认不出「抱起来」。
+     */
+    pushRate: clampInt(input?.pushRate, 20, 5, 100),
+    /*
+     * 多久推一次。这直接就是**反应延迟** —— 抱完最多等这么久角色才开口。
+     * 上限 30 秒；下限 1 秒（手机每秒发一个请求已经挺费电了）。
+     */
+    pushInterval: clampInt(input?.pushInterval, 2, 1, 30),
+    magnitude: str(input?.magnitude).trim() || "acc",
+    time: str(input?.time).trim() || "acc_time",
+    cover: str(input?.cover).trim(),
+    // 上限给得很松：接近传感器是厘米（0~10），光线传感器是勒克斯（室内几百，
+    // 太阳底下几万），同一个框要装得下两种量纲
+    coverBelow: clampNum(input?.coverBelow, DOLL_DEFAULTS.coverBelow, 0, 200_000),
+    /*
+     * 下限 200ms：再密就只是在给那个单线程服务器添堵，拿回来的样本还是同一批。
+     * 上限 3 秒：抱一下最短也就一两秒，轮询比那还慢会整次漏掉。两头都在
+     * doll.js 定义（POLL_MIN_MS / POLL_MAX_MS）。
+     */
+    intervalMs: clampInt(input?.intervalMs, 400, POLL_MIN_MS, POLL_MAX_MS),
+    // 缺键当开 —— 这个默认开着，老配置升上来不该变成关
+    autoStart: input?.autoStart === undefined ? true : Boolean(input.autoStart),
+    start: clampNum(input?.start, DOLL_DEFAULTS.start, 0.05, 100),
+    hold: clampNum(input?.hold, DOLL_DEFAULTS.hold, 0.01, 100),
+    // 安静判定的下限 500ms：短于这个会把「抱着换个姿势」切成两次拥抱
+    quietMs: clampInt(input?.quietMs, DOLL_DEFAULTS.quietMs, 500, 60_000),
+    // 0 = 不设下限（什么动静都算一次抱）。真有人想要那种灵敏度，留着这条路
+    minHoldMs: clampInt(input?.minHoldMs, DOLL_DEFAULTS.minHoldMs, 0, 60_000),
+    soft: clampNum(input?.soft, DOLL_DEFAULTS.soft, 0.05, 100),
+    /*
+     * 「用力」那一档不能低于「轻轻」那一档 —— 填反了的话 hugStrength 里
+     * `peak < soft` 会先命中，所有拥抱都变成「轻轻」，而用户在界面上看到的
+     * 两个数明明是一大一小。所以这儿直接托底，不报错也不留着错的值。
+     */
+    firm: Math.max(
+      clampNum(input?.firm, DOLL_DEFAULTS.firm, 0.05, 1_000),
+      clampNum(input?.soft, DOLL_DEFAULTS.soft, 0.05, 100)
+    ),
+  };
+}
+
+/**
+ * 角色身上的「共感娃娃」：开关、那句系统提示的文案、冷却。
+ *
+ * 为什么文案在角色上而手机地址在全局：文案是**这个角色**该怎么被告知这件事
+ * （娃娃叫什么、用什么语气说），一人一份才有意义；手机地址是用户那部手机，
+ * 全局一份（见 DEFAULT_CONFIG.dollApi）。
+ *
+ * 冷却也在角色上：同一次拥抱会让**所有**开了这个开关的角色各收到一句，
+ * 而「多久算一次新的拥抱」是每个角色的性格问题（有的角色天天被抱也不腻，
+ * 有的设成一小时才响一次）。
+ */
+function normalizeHug(input) {
+  return {
+    enabled: Boolean(input?.enabled),
+    /*
+     * 空着**不**回落成默认文案，而是存空串、由 doll.js:renderHugLine 在用的
+     * 时候回落。理由和别处的提示词一样：存成默认值的话，以后改了默认文案，
+     * 老用户那边还是老的一句，而他从来没动过这个框。
+     */
+    template: str(input?.template, HUG_TEMPLATE_RICH),
+    /*
+     * 冷却（分钟）。0 = 不冷却，抱几下就响几下。
+     *
+     * 默认 10 分钟和主动消息发完之后那个冷却（proactive.js:COOLDOWN_MS）一样 ——
+     * 都是在防「模型连着自言自语」：一次拥抱就是一整轮模型调用，抱着玩偶
+     * 揉十下会变成十轮。冷却期内的那几次不丢，攒成 `{{次数}}` 下次一起说
+     * （见 imessage.js:hugTick）。
+     */
+    cooldownMinutes: clampInt(input?.cooldownMinutes, 10, 0, 24 * 60),
   };
 }
 
@@ -2947,6 +3514,11 @@ function normalizeUser(input, id) {
     id,
     name: str(input?.name),
     description: str(input?.description),
+    /*
+     * 常用地址，瑞幸点单找最近的门店用（luckin.js:resolveLocation）。对方在对话里
+     * 发了位置的话那个优先。可以写文字地址，也可以直接贴「纬度,经度」或苹果地图链接。
+     */
+    address: str(input?.address).trim().slice(0, 300),
     scope: input?.scope === "roles" ? "roles" : "global",
     roleRefs: Array.isArray(input?.roleRefs)
       ? [...new Set(input.roleRefs.map((r) => str(r).trim()).filter(Boolean))]
@@ -3068,8 +3640,13 @@ export function normalizeConfig(input) {
   base.worldBooks = normalizeWorldBooks(input.worldBooks);
   base.weatherApi = normalizeWeatherApi(input.weatherApi);
   base.searchApi = normalizeSearchApi(input.searchApi);
+  base.luckinApi = normalizeLuckinApi(input.luckinApi);
+  base.mcdApi = normalizeLuckinApi(input.mcdApi);
   base.spyApi = normalizeSpyApi(input.spyApi);
+  base.dollApi = normalizeDollApi(input.dollApi);
   base.ttsApi = normalizeTtsApi(input.ttsApi);
+  base.sttApi = normalizeSttApi(input.sttApi);
+  base.callNode = normalizeCallNode(input.callNode);
   base.referenceImages = normalizeReferenceImages(input.referenceImages);
   base.mcpServers = normalizeMcpServers(input.mcpServers);
   base.memories = normalizeMemories(input.memories);
@@ -3204,14 +3781,27 @@ function mergeSecrets(main, data) {
     merged.searchApi = data.searchKeys;
   }
   // TTS 同理（四家的开关也在这块里，一起读回来）
+  if (data.sttKeys && typeof data.sttKeys === "object") {
+    merged.sttApi = data.sttKeys;
+  }
+  if (data.callNodeKeys && typeof data.callNodeKeys === "object") {
+    merged.callNode = data.callNodeKeys;
+  }
   if (data.ttsKeys && typeof data.ttsKeys === "object") {
     merged.ttsApi = data.ttsKeys;
   }
   // 查岗手机那条腿同理（SMTP 密码 + 收图口子的校验密钥）
   // MCP 服务器列表整块只住密钥文件里（地址、token、环境变量）
   if (Array.isArray(data.mcpKeys)) merged.mcpServers = data.mcpKeys;
+  // 瑞幸的 token 同理
+  if (data.luckinKeys && typeof data.luckinKeys === "object") merged.luckinApi = data.luckinKeys;
+  if (data.mcdKeys && typeof data.mcdKeys === "object") merged.mcdApi = data.mcdKeys;
   if (data.spyKeys && typeof data.spyKeys === "object") {
     merged.spyApi = data.spyKeys;
+  }
+  // 共感娃娃那条腿同理（手机的内网地址 + 开关 + 阈值，整块只住密钥文件里）
+  if (data.dollKeys && typeof data.dollKeys === "object") {
+    merged.dollApi = data.dollKeys;
   }
   /*
    * 云备份整块也只住密钥文件里。
@@ -3283,8 +3873,13 @@ function writeToDisk(normalized) {
     weatherKeys: normalized.weatherApi,
     searchKeys: normalized.searchApi,
     spyKeys: normalized.spyApi,
+    dollKeys: normalized.dollApi,
     mcpKeys: normalized.mcpServers,
+    luckinKeys: normalized.luckinApi,
+    mcdKeys: normalized.mcdApi,
     ttsKeys: normalized.ttsApi,
+    sttKeys: normalized.sttApi,
+    callNodeKeys: normalized.callNode,
     cloudKeys: normalized.cloudBackup,
   });
 
@@ -3302,10 +3897,19 @@ function writeToDisk(normalized) {
     searchApi: {},
     // 查岗手机那条腿（SMTP 密码 + 收图密钥）同理
     spyApi: {},
+    // 共感娃娃那条腿（手机的内网地址）同理
+    dollApi: {},
     // MCP 服务器列表同理
     mcpServers: [],
+    // 瑞幸 token 同理
+    luckinApi: {},
+    mcdApi: {},
     // TTS 同理
     ttsApi: {},
+    // 转写的凭据同理
+    sttApi: {},
+    // 通话节点那条腿（配对密钥 + 节点地址）同理
+    callNode: {},
     // 云备份整块同理
     cloudBackup: {},
   });
@@ -3338,6 +3942,9 @@ export function loadConfig() {
   // 抢在 app.listen 的回调之前进来
   migrateDataLayout();
   ensureLayout();
+  // 老用户补一份「通话默认预设」，只补一次。必须在读盘之前、而且只能在这条
+  // 读的路上做 —— 理由见 datadir.js:topUpCallPreset
+  topUpCallPreset();
   cachedConfig = normalizeConfig(readRawFromDisk());
   return cachedConfig;
 }

@@ -25,6 +25,9 @@
  * 它跟着消息进存档，见 env.js 的文件头。
  */
 
+import { LUCKIN_SHORT_HINT, luckinWanted } from "./luckin.js";
+import { MCD_SHORT_HINT, mcdWanted } from "./mcd.js";
+import { reminderPromptState } from "./reminder.js";
 import { applyVars, resolveEndpoint, resolveUser } from "./config.js";
 import { listEmojiTags } from "./emoji.js";
 import { stripEnvPrefix } from "./env.js";
@@ -229,7 +232,7 @@ function effectListText(keys) {
  * ROLE_GATED_CHILDREN 里，由下面 spyText 单独处理 —— 两条腿都关就整条跳过，
  * 只开一条腿时还要把另一条腿那几行删掉（见那个函数的注释）。
  */
-function formatBlock(entry, fill, role, config) {
+function formatBlock(entry, fill, role, config, sent, orders = {}) {
   const lines = [];
   const intro = fill(entry?.content ?? "");
   if (intro) lines.push(intro);
@@ -263,6 +266,46 @@ function formatBlock(entry, fill, role, config) {
     // 这正是用户要的省 token —— 苹果自带的 emoji 几百个，全塞进去每轮都在白烧。
     // 空清单留着比不留更糟：模型会看见「你必须从【可用emoji】里选」后面跟一片空白，
     // 然后自己编一个。
+    /*
+     * 瑞幸：完整说明只在这几句聊到咖啡时才给，平时换成一句话（luckin.js:luckinWanted）。
+     * 用户要的省 token —— 完整那段两百来字，多数轮次根本用不上。
+     */
+    if (child.kind === "luckin" || child.kind === "mcd") {
+      const mcd = child.kind === "mcd";
+      const luckin = orders[child.kind];
+      /*
+       * luckin 是 imessage.js:luckinPromptState 算好的这一轮该给什么：
+       *  - mode "full"：完整说明，{{瑞幸菜单变量}} 换成菜单或进行中的那一单；
+       *  - mode "short" / "done"：只给一句话（没聊咖啡 / 刚点完就不注入了）；
+       *  - 没传（主动消息这类）：按 luckinWanted 判，不带菜单。
+       */
+      const full = luckin ? luckin.mode === "full" : (mcd ? mcdWanted : luckinWanted)(sent);
+      // 刚下过单：不带菜单和完整说明，只带「刚点了什么、怎么取消」那一句
+      if (luckin?.mode === "done" && luckin.extra) {
+        marks.push(`<${tag}>${luckin.extra}</${tag}>`);
+        kinds.push(child.kind);
+        continue;
+      }
+      text = full
+        ? text
+            .replace(/\{\{\s*(?:瑞幸|麦当劳)菜单变量\s*\}\}/g, luckin?.extra ?? "")
+            .replace(/\n{2,}/g, "\n")
+            .trim()
+        : mcd ? MCD_SHORT_HINT : LUCKIN_SHORT_HINT;
+    }
+    /*
+     * 定时提醒：现在几点（{{user}} 那边）、默认提前量、还没到点的那几条。
+     * imessage.js 按 {{user}} 的时区算好传进来；没传（别的调用方）就按系统时区现算。
+     */
+    if (child.kind === "reminder") {
+      const st = orders.reminder ?? reminderPromptState(role?.id ?? "", null);
+      text = text
+        .replace(/\{\{\s*提醒当前时间\s*\}\}/g, st.now)
+        .replace(/\{\{\s*提醒提前量\s*\}\}/g, String(st.lead))
+        .replace(/\{\{\s*提醒列表变量\s*\}\}/g, st.list)
+        .replace(/\n{2,}/g, "\n")
+        .trim();
+    }
     if (child.kind === "react") {
       const list = Array.isArray(role?.reactSend?.emojis) ? role.reactSend.emojis : [];
       if (!list.length) continue;
@@ -433,8 +476,8 @@ function dropEmptyBlocks(text, vars) {
  * **必须剥 env 前缀**（env.js:stripEnvPrefix），这是这个函数存在的另一半理由。
  * 进上文的 user 消息长这样：
  *
- *   [niki发送当地时间 CST : 2026-09-22 19:25:58 | 周二, 工作日 | niki当地天气:
- *    南宁 多云 28.7°C … ; Charlie当地天气: 旧金山 …]Lucien先生这个称呼排在第几
+ *   [小明发送当地时间 CST : 2026-09-22 19:25:58 | 周二, 工作日 | 小明当地天气:
+ *    上海 多云 28.7°C … ; Ken当地天气: 旧金山 …]Lucien先生这个称呼排在第几
  *
  * 两百来字的时间和天气，裹着十四个字的正文。而记忆**入库时是剥过的**
  * （memoryhooks.js:recordTurn），两边根本不在一个文本分布上：向量被样板
@@ -772,7 +815,13 @@ function formatHistoryLines(messages, charName, userName, maxChars = 6000) {
 
 export async function buildPrompt(config, role, user, history, weatherNote = "", opts = {}) {
   const offline = opts?.mode === "offline";
-  const preset = resolvePreset(config, role, offline ? "offline" : "online");
+  /*
+   * 通话（`mode === "call"`）走自己那份预设，但**上下文按线上的规矩裁** ——
+   * 通话和发短信共用同一条历史，用线下那套（按轮数、一轮上千字）会把
+   * 短信那几十条挤没。
+   */
+  const mode = opts?.mode === "call" ? "call" : offline ? "offline" : "online";
+  const preset = resolvePreset(config, role, mode);
   const hist = trimHistory(history, role, { offline });
 
   const vars = {
@@ -812,14 +861,23 @@ export async function buildPrompt(config, role, user, history, weatherNote = "",
   let books = [];
   if (worldEntry?.enabled) {
     /*
-     * 线下走**另一份书单**：`role.offline.worldBookRefs`（用户要的「可在线下预设内
-     * 单独配置角色线下世界书」）。
+     * 三种玩法各自的书单。手法都是传一个换掉 refs 的浅拷贝，而不是给
+     * worldBooksFor 加参数 —— 那个函数在前端 labels.js 里有一份镜像，加参数
+     * 就得两边一起改，而这里换的只是它读的那一个字段。global 的书照旧三路都生效。
      *
-     * 手法是传一个换掉 refs 的浅拷贝，而不是给 worldBooksFor 加参数 ——
-     * 那个函数在前端 labels.js 里有一份镜像，加参数就得两边一起改，
-     * 而这里换的只是它读的那一个字段。global 的书照旧对两种玩法都生效。
+     *  - **线下**：`role.offline.worldBookRefs`，**另一份书单**。空着就真的一本
+     *    都不挂 —— 剧情要的设定（房间长什么样）和聊天要的往往不是同一批。
+     *  - **通话**：`role.call.worldBookRefs`，但**空 = 跟着线上走**。通话和短信
+     *    共用同一条历史、同一个场景，默认该一样；单独挑是为了把提示词压薄
+     *    （实测一轮 19k token，模型每轮要多读好几秒）。
+     *  - 线上：角色自己那份。
      */
-    const forBooks = offline ? { ...role, worldBookRefs: role?.offline?.worldBookRefs ?? [] } : role;
+    const callBooks = mode === "call" ? (role?.call?.worldBookRefs ?? []) : [];
+    const forBooks = offline
+      ? { ...role, worldBookRefs: role?.offline?.worldBookRefs ?? [] }
+      : callBooks.length
+        ? { ...role, worldBookRefs: callBooks }
+        : role;
     books = worldBooksFor(config, forBooks);
     if (books.length) world = activate(books, sent);
   }
@@ -858,7 +916,7 @@ export async function buildPrompt(config, role, user, history, weatherNote = "",
          * 标记，然后被原样打进剧情正文里。
          */
         if (offline) break;
-        parts.push({ role: "system", content: formatBlock(entry, fill, role, config) });
+        parts.push({ role: "system", content: formatBlock(entry, fill, role, config, sent, { luckin: opts?.luckin, mcd: opts?.mcd, reminder: opts?.reminder }) });
         break;
       case "context": {
         const woven = weaveDepths(sent, world.depths);
@@ -903,6 +961,19 @@ export async function buildPrompt(config, role, user, history, weatherNote = "",
          * 所以这里不用再判一次 offline。
          */
         parts.push({ role: "system", content: wrap("User_Choices", fill(entry.content ?? "")) });
+        break;
+      case "callHowto":
+        /*
+         * 「怎么打电话」（通话预设专属）。
+         *
+         * 排在 format 后面：先讲清有哪些功能（通话里那些是保留的，角色打电话时
+         * 照样能转账、发卡片），再讲「但在电话里要这么说话」。顺序反了的话模型
+         * 读到的最后一条是「可以发表情包」，它就真发了。
+         *
+         * 线上/线下预设里不会有这个 kind（normalizeEntries 会把它转成 custom），
+         * 所以这里不用再判一次 mode。
+         */
+        parts.push({ role: "system", content: wrap("Phone_Call", fill(entry.content ?? "")) });
         break;
       case "custom":
         // 可移动条目不自动包标签 —— 名字是用户随便起的，未必是合法标签名。

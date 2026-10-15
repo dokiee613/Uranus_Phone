@@ -342,7 +342,53 @@ export function faultAdvice(err) {
 }
 
 /** 我们会往请求体里塞的生成参数，按「被拒了就脱掉」的顺序列。 */
-const TUNABLE_FIELDS = ["temperature", "top_p", "frequency_penalty", "presence_penalty"];
+const TUNABLE_FIELDS = [
+  "temperature",
+  "top_p",
+  "frequency_penalty",
+  "presence_penalty",
+  // 「少思考」那一路塞的（见 THINKING_LADDER）。reasoning_effort 不在这张表里 ——
+  // 它有自己的降档逻辑，交给这里会直接删掉，白丢一次「换个档位试试」的机会
+  "enable_thinking",
+];
+
+/* ================= 让模型少思考 ================= */
+
+/**
+ * `reasoning_effort` 的降档梯子。
+ *
+ * ── 为什么是梯子，而不是一个值 ──
+ *
+ * 「关掉思考」这件事**各家能关到什么程度不一样，而且和文档写的不一致**：
+ *
+ *  - `none` 只在 Gemini 2.5 那一代真能关掉；
+ *  - Gemini 3 一代**关不掉**，只能压到最低档。而最低档叫什么又分版本：
+ *    3.0–3.6 的 Flash 有 `minimal`，3.7 / 3.8 的 Flash 把它去掉了，
+ *    于是文档里还列着 `minimal`、实际打过去回 400 说「valid values are
+ *    high, low, medium, none」；
+ *  - 中转站再加一层，认不认这个字段全看它自己。
+ *
+ * 所以不去维护「哪个模型支持哪些档」那张表（中转站的模型名五花八门，新模型
+ * 每周都有，而且这表一定会过期）。改成和 `rejectedParamField` 同一个路子：
+ * **先要最狠的那一档，上游嫌哪儿不对就降一档重打**，降到底就把字段脱掉。
+ *
+ * `minimal` 排在 `low` 前面是因为它更省，虽然新版 Flash 不认它 —— 不认就
+ * 自动落到 `low`，多花一个来回，但在支持它的型号上能省更多。
+ */
+const THINKING_LADDER = ["none", "minimal", "low"];
+
+/**
+ * 上游是不是在抱怨 `reasoning_effort`（或原生 Gemini 那边的 thinking_level）。
+ *
+ * 认得比 `rejectedParamField` 松一点：这个字段的报错措辞特别杂，有的只说
+ * 「valid values are …」而完全不提 unsupported。
+ */
+function rejectsThinking(status, text) {
+  if (status !== 400 && status !== 422) return false;
+  const s = String(text ?? "");
+  if (!/reasoning[_ ]?effort|thinking[_ ]?(level|budget|config)/i.test(s)) return false;
+  return /unsupported|not\s+support|unrecognized|invalid|valid\s+values|cannot|can't|不支持/i.test(s);
+}
 
 /**
  * 上游是不是在说「你发的某个生成参数我不收」，是的话返回那个字段名。
@@ -948,6 +994,29 @@ async function chatRaw(endpoint, messages, opts = {}) {
     logDebug(label, `${model} 不收生成参数，这轮温度 / Top P / 两个惩罚项都不发`);
   }
 
+  /*
+   * ── 让模型少思考（通话那条路要的） ──
+   *
+   * **不受上面 strict 那条管**。strict 说的是「温度那几个采样参数一个都不能
+   * 带」，而 `reasoning_effort` 恰恰是 Gemini 3 认的那个字段 —— 真正需要关思考
+   * 的也正是这批模型，在这儿一起挡掉就等于这个开关对它们永远无效。
+   *
+   * 两个字段：
+   *  - `reasoning_effort`：OpenAI 定的、现在各家和中转站都跟着认的那个。
+   *    从梯子最狠的一档开始要，被嫌了就降档，见 THINKING_LADDER。
+   *  - `enable_thinking`：Qwen / DeepSeek 那一路自己的开关，和上面那个
+   *    不是一回事，两个都发。中转站不认会被它点名抱怨，然后走
+   *    rejectedParamField 脱掉（它在 TUNABLE_FIELDS 里）。
+   *
+   * Claude 不在这儿管：它的 thinking 本来就要显式申请才开，我们从来不申请。
+   */
+  let thinkingStep = 0;
+  if (opts.noThinking) {
+    body.reasoning_effort = THINKING_LADDER[0];
+    body.enable_thinking = false;
+    logDebug(label, `这轮要求少思考（reasoning_effort=${body.reasoning_effort}）`);
+  }
+
   // 0 = 不限制，交给上游默认。opts.maxTokens 是「测试连接」那种场合直接指定的
   const maxTokens = opts.maxTokens ?? p.maxTokens;
   if (maxTokens > 0) body.max_tokens = maxTokens;
@@ -1104,6 +1173,26 @@ async function chatRaw(endpoint, messages, opts = {}) {
       refusalTries += 1;
       nudge();
       logWarn(label, `被内容安全拦下，换个说法重问（还能试 ${refusalLeft} 次）`, why);
+      continue;
+    }
+
+    /*
+     * 上游嫌 `reasoning_effort` 这一档不行：**降一档重打**，降到底再脱掉。
+     *
+     * 要排在下面那条通用的「脱参数」前面 —— 那条看到这个字段只会删掉它，
+     * 而很多型号（Gemini 3 一代）是「关不掉但能压到最低」，直接删等于
+     * 放着最低档不用、回到默认的满额思考。
+     */
+    if (body.reasoning_effort !== undefined && rejectsThinking(result.status, result.text)) {
+      thinkingStep += 1;
+      const next = THINKING_LADDER[thinkingStep];
+      if (next) {
+        body.reasoning_effort = next;
+        logWarn(label, `${model} 不收 reasoning_effort=${THINKING_LADDER[thinkingStep - 1]}，降到 ${next} 重打`, why);
+      } else {
+        delete body.reasoning_effort;
+        logWarn(label, `${model} 这几档思考力度都不收，这轮不管思考了（它会按自己的默认来）`, why);
+      }
       continue;
     }
 
@@ -1306,6 +1395,7 @@ export async function chatWithFallback(primary, fallback, messages, params = {},
       onDelta: opts.onDelta,
       tools: opts.tools,
       toolChoice: opts.toolChoice,
+      noThinking: opts.noThinking,
     });
     return { ...out, usedFallback: false };
   } catch (primaryError) {
@@ -1364,6 +1454,8 @@ export async function chatWithFallback(primary, fallback, messages, params = {},
         onDelta: opts.onDelta,
         tools: opts.tools,
         toolChoice: opts.toolChoice,
+        // 副 API 也要少思考 —— 换线换的是模型，不是这一轮的需求
+        noThinking: opts.noThinking,
       });
       logInfo("LLM", "副 API 顶上了，这轮由它回复");
       return { ...out, usedFallback: true };
@@ -1593,6 +1685,84 @@ function geminiNativeUrl(url, model) {
  * @returns {Promise<string>} 转写/描述文本
  * @throws {Error} 识别失败
  */
+/**
+ * 这次请求里，媒体到底有没有到模型跟前。
+ *
+ * **为什么需要这道判据** —— 有的中转站不透传 `inline_data`：它把 Gemini 原生
+ * 请求翻译成 OpenAI 的 chat 格式再转发，翻译时把媒体那一段整个丢掉。结果是
+ * HTTP 200、模型也正常回话，回的却是「我没有收到音频，请提供」。
+ *
+ * 不判的话这句话会被当成转写结果写进上下文，角色于是对着一句根本不存在的
+ * 「请提供音频」开始回应 —— 比直接报错难查得多，因为日志上写着「识别成功」。
+ * （实测：api.cottonapi.cloud 的 gemini-3.8-flash，三种请求格式全军覆没，
+ * 它自己的账单里明明白白写着 `semantic: "openai"`、`audio_tokens: 0`。）
+ *
+ * 两条证据，**token 账单优先**：
+ *
+ *  1. **账单里这个模态算了几个 token**。到了模型跟前就一定会计费 —— 3 秒音频
+ *     在 Gemini 那儿大约 100 个 token。明确写着 0 就是没到。这条最硬，不受
+ *     模型怎么措辞影响。各家字段形状不一样，三处都翻一遍。
+ *  2. **回复内容像是在说「我没收到」**。只在账单给不出数时才用 —— 它可能误伤
+ *     （对方真的在录音里说「请提供音频」），所以额外要求回复很短。
+ *     六项结构化输出全是【无法确认】也算：那是模型什么都没听见时的样子。
+ *
+ * @returns {string} 空串 = 到了（或看不出没到）；非空 = 没到，内容是判据说明
+ */
+export function mediaMissing(usage, text, kind) {
+  const n = mediaTokens(usage, kind.modality);
+  if (n === 0) return `账单里${kind.noun}是 0 token`;
+  if (n > 0) return ""; // 计了费就是到了，不用再看措辞
+
+  // 账单给不出数（中转站不回 usage，或字段形状不认识），退回看措辞
+  const t = String(text ?? "").trim();
+  if ((t.match(/【无法确认】/g) ?? []).length >= 3) return "六项全是【无法确认】";
+  /*
+   * 30 字是故意压得很死的 —— 「我没有收到音频」只有七个字，而一段真的转写
+   * 很少这么短。放宽到 60 就会误伤：实测一句四十来字的正常转写里只要出现
+   * 「……客服一直让他请提供音频……」就被判成没到。
+   */
+  if (
+    t.length <= 30 &&
+    /(没有?|未|无法)(收到|接收|听到|看到)|请(提供|发送|上传|再发)|尚未(收到|提供)|no (audio|video|file)|didn't receive|please (provide|share|upload)/i.test(t)
+  ) {
+    return `模型回的是「${t.slice(0, 40)}」`;
+  }
+  return "";
+}
+
+/**
+ * 从 usage 里翻出某个模态算了几个 token。
+ *
+ * 三种形状都见过：
+ *  - Gemini 原生：`promptTokensDetails: [{modality: "AUDIO", tokenCount: 106}]`
+ *  - 中转站转译：`billing_usage.openai_usage.prompt_tokens_details.audio_tokens`
+ *  - OpenAI 自己：`prompt_tokens_details.audio_tokens`
+ *
+ * @returns {number} 翻不到返回 -1（**不是 0** —— 「没这个字段」和「确实是 0」
+ *   是两回事，前者不能据此判定没到）
+ */
+export function mediaTokens(usage, modality) {
+  if (!usage || typeof usage !== "object") return -1;
+
+  const list = usage.promptTokensDetails ?? usage.prompt_tokens_details;
+  if (Array.isArray(list)) {
+    const hit = list.find((d) => String(d?.modality ?? "").toUpperCase() === modality);
+    if (hit && Number.isFinite(Number(hit.tokenCount))) return Number(hit.tokenCount);
+    // 数组在、但没有这个模态那一条 = 这个模态一个 token 都没算
+    if (list.length) return 0;
+  }
+
+  const flat =
+    (Array.isArray(list) ? null : list) ??
+    usage.billing_usage?.openai_usage?.prompt_tokens_details ??
+    null;
+  if (flat && typeof flat === "object") {
+    const v = flat[`${modality.toLowerCase()}_tokens`];
+    if (Number.isFinite(Number(v))) return Number(v);
+  }
+  return -1;
+}
+
 async function inlineMedia(endpoint, prompt, media, kind) {
   const label = endpoint?.label ? `${kind.what} API（${endpoint.label}）` : `${kind.what} API`;
   const base = trimBase(endpoint?.url);
@@ -1739,9 +1909,46 @@ async function inlineMedia(endpoint, prompt, media, kind) {
   }
 
   const usage = result.data?.usageMetadata;
+
+  /*
+   * 到这儿请求是成功的、模型也回话了 —— 但它未必真的听/看到了东西。
+   * 见 mediaMissing 的注释：有的中转站会把媒体那一段在转译时丢掉。
+   *
+   * 这种情况必须**抛错**而不是把文本返回去：返回去的话这句「请提供音频」
+   * 会被当成转写结果进上下文，角色对着一句不存在的话开始回应，而日志上
+   * 还写着「识别成功」。抛错至少让人看得见、也能顺着提示去换一个源。
+   */
+  const missing = mediaMissing(usage, text, kind);
+  if (missing) {
+    /*
+     * 长的说明只进日志。抛出去那句会被 describeVoices 原样拼进提示词
+     * （imessage.js:1600 的「识别失败（…）」），在那儿长篇大论既占 token
+     * 又帮不上模型的忙。
+     */
+    logWarn(
+      label,
+      `${kind.noun}没到模型那儿（${missing}）—— 这个服务商源不透传${kind.noun}`,
+      `请求：${model}，${kind.noun} ${kb}KB / ${mimeType}\n` +
+        `模型回的：${text.slice(0, 300)}\n` +
+        (usage ? `token 用量：${JSON.stringify(usage)}\n` : "（上游没给 token 用量）\n") +
+        `\n怎么办：这家中转站多半把 Gemini 原生请求翻译成 OpenAI 格式再转发，` +
+        `翻译时把${kind.noun}那一段丢了。去「连接」里新建一个源，给「${kind.what}」单独指过去 ——` +
+        `官方 Gemini（https://generativelanguage.googleapis.com，类型选 Gemini）最稳；` +
+        `想继续用中转站的话，换一家、或者换同一家的另一个模型通道再试。`
+    );
+    throw faultKind(
+      new Error(
+        `${label} 把${kind.noun}丢了（${missing}）——这个源不透传${kind.noun}，去「连接」里给「${kind.what}」单独换一个源`
+      ),
+      // 归到 config：能修的地方在 Uranus 的设置里（换个源），不是找服务商客服
+      "config"
+    );
+  }
+
+  const heard = mediaTokens(usage, kind.modality);
   logDebug(
     kind.what,
-    `${model} 回了 ${text.length} 字，耗时 ${ms}ms`,
+    `${model} 回了 ${text.length} 字，耗时 ${ms}ms` + (heard > 0 ? `（${kind.noun} ${heard} token）` : ""),
     usage ? `token 用量：${JSON.stringify(usage)}` : undefined
   );
 
@@ -1760,6 +1967,8 @@ export async function transcribeAudio(endpoint, prompt, audio) {
   return inlineMedia(endpoint, prompt, audio, {
     what: "听音",
     noun: "音频",
+    // 账单里按模态分的 token 名字，mediaMissing 用它判「到底听见没有」
+    modality: "AUDIO",
     defaultPrompt: DEFAULT_AUDIO_PROMPT,
     fallbackMime: "audio/mpeg",
   });
@@ -1791,6 +2000,7 @@ export async function describeVideo(endpoint, prompt, video) {
   return inlineMedia(endpoint, prompt, video, {
     what: "看视频",
     noun: "视频",
+    modality: "VIDEO",
     defaultPrompt: DEFAULT_VIDEO_PROMPT,
     fallbackMime: "video/mp4",
   });
